@@ -50,7 +50,9 @@ func selectionSignature(for paths: Set<String>) -> SelectionSig {
 /// Each RepoFileManagerViewModel owns its own PathMatchWorker instance
 /// to maintain per-window isolation in multi-window scenarios.
 public actor PathMatchWorker {
-    
+
+    public init() {}
+
     // MARK: - Index Cache (single-entry, keyed by generation)
     
     private var lastIndexID: UInt64?
