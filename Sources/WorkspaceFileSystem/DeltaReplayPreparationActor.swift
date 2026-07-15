@@ -177,9 +177,20 @@ public enum FileSystemDeltaPreparation {
 		)
 	}
 
+	/// Coalesces a raw delta batch to at most one delta per (path, kind).
+	///
+	/// Descendants of a removed folder are redundant for replay consumers
+	/// (`prepareBatch` — RepoPrompt's replay prunes subtrees on `folderRemoved`
+	/// and re-coalesces before applying), so the default drops them wholesale.
+	/// The engine's publish boundary passes `preservingDescendantRemovals: true`:
+	/// `WorkspaceFileWatching` consumers are per-item and need the engine's
+	/// subtree-removal sweep (contract parity with the polling
+	/// `MacOSWorkspaceFileManager`), while descendant adds/modifies under a
+	/// removed folder remain droppable noise.
 	public static func coalesce(
 		_ deltas: [FileSystemDelta],
-		inRoot standardizedRoot: String? = nil
+		inRoot standardizedRoot: String? = nil,
+		preservingDescendantRemovals: Bool = false
 	) -> [FileSystemDelta] {
 		enum ItemKind {
 			case file
@@ -245,12 +256,19 @@ public enum FileSystemDeltaPreparation {
 
 		if !removedFolders.isEmpty {
 			chosen.removeAll { pair in
-				for folder in removedFolders where pair.rel != folder {
-					if StandardizedPath.isDescendant(pair.rel, of: folder) {
+				let isUnderRemovedFolder = removedFolders.contains { folder in
+					pair.rel != folder && StandardizedPath.isDescendant(pair.rel, of: folder)
+				}
+				guard isUnderRemovedFolder else { return false }
+				if preservingDescendantRemovals {
+					switch pair.delta {
+					case .fileRemoved, .folderRemoved:
+						return false
+					default:
 						return true
 					}
 				}
-				return false
+				return true
 			}
 		}
 

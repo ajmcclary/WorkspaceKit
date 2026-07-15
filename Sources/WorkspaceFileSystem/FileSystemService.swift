@@ -410,6 +410,14 @@ public actor FileSystemService {
 	public let path: String
 	private let rootURL: URL
 	private let canonicalRootURL: URL
+	/// The root as the kernel reports it (POSIX realpath). Unlike
+	/// `resolvingSymlinksInPath()`, realpath keeps the `/private` prefix, which
+	/// is the form FSEvents delivers for roots under symlinked locations
+	/// (/tmp, /var, …). Event mapping must prefix-match against this form with
+	/// pure string operations: the standardization fallbacks strip `/private`
+	/// only when the path still exists, so events for just-deleted paths would
+	/// otherwise map outside the root and be dropped.
+	private let realRootPath: String
 	private var canonicalRootPath: String { canonicalRootURL.path }
 	private var standardizedRootPath: String { rootURL.path }
 	private var respectGitignore: Bool
@@ -495,6 +503,7 @@ public actor FileSystemService {
 		self.path = path
 		self.rootURL = URL(fileURLWithPath: path).standardizedFileURL
 		self.canonicalRootURL = rootURL.resolvingSymlinksInPath()
+		self.realRootPath = Self.posixRealPath(rootURL.path) ?? canonicalRootURL.path
 		self.respectGitignore = respectGitignore
 		self.respectRepoIgnore = respectRepoIgnore
 		self.respectCursorignore = respectCursorignore
@@ -639,6 +648,7 @@ public actor FileSystemService {
 		self.path = path
 		self.rootURL = URL(fileURLWithPath: path).standardizedFileURL
 		self.canonicalRootURL = rootURL.resolvingSymlinksInPath()
+		self.realRootPath = Self.posixRealPath(rootURL.path) ?? canonicalRootURL.path
 		self.respectGitignore = respectGitignore
 		self.respectRepoIgnore = respectRepoIgnore
 		self.respectCursorignore = respectCursorignore
@@ -1972,7 +1982,11 @@ public actor FileSystemService {
 	#endif
 
 	private func coalescedPublishableDeltas(from deltas: [FileSystemDelta]) -> [FileSystemDelta] {
-		FileSystemDeltaPreparation.coalesce(deltas, inRoot: canonicalRootPath)
+		FileSystemDeltaPreparation.coalesce(
+			deltas,
+			inRoot: canonicalRootPath,
+			preservingDescendantRemovals: true
+		)
 	}
 	
 	// MARK: - FSEvent Setup
@@ -5989,6 +6003,14 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		case inside(relative: String)
 		case outside(originalAbsolute: String)
 	}
+
+	/// Kernel-resolved absolute path (keeps `/private`, unlike Foundation's
+	/// symlink resolution). Returns nil when the path does not exist.
+	private nonisolated static func posixRealPath(_ path: String) -> String? {
+		guard let resolved = realpath(path, nil) else { return nil }
+		defer { free(resolved) }
+		return String(cString: resolved)
+	}
 	
 	private func fileOrFolderIsDir(_ relativePath: String) -> Bool {
 		let full = (path as NSString).appendingPathComponent(relativePath)
@@ -6026,6 +6048,12 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 			let rel = absolutePath.dropFirst(canonicalRootPath.count)
 			return .inside(relative: Self.trimPathSlashes(rel))
 		}
+		if realRootPath != standardizedRootPath,
+			realRootPath != canonicalRootPath,
+			hasDirectoryPrefix(absolutePath, realRootPath) {
+			let rel = absolutePath.dropFirst(realRootPath.count)
+			return .inside(relative: Self.trimPathSlashes(rel))
+		}
 		return mapToRelativeEventPathFallback(absolutePath)
 	}
 
@@ -6048,6 +6076,13 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 				hasDirectoryPrefix(absolutePath, canonicalRootPath) {
 				diagnostics.fastCanonicalRootHitCount += 1
 				let rel = absolutePath.dropFirst(canonicalRootPath.count)
+				return .inside(relative: Self.trimPathSlashes(rel))
+			}
+			if realRootPath != standardizedRootPath,
+				realRootPath != canonicalRootPath,
+				hasDirectoryPrefix(absolutePath, realRootPath) {
+				diagnostics.fastCanonicalRootHitCount += 1
+				let rel = absolutePath.dropFirst(realRootPath.count)
 				return .inside(relative: Self.trimPathSlashes(rel))
 			}
 		} else {
@@ -6075,7 +6110,19 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 			let rel = canonicalAbsolute.dropFirst(canonicalRootPath.count)
 			return .inside(relative: Self.trimPathSlashes(rel))
 		}
-		
+
+		// Deleted paths defeat the existence-checked standardizations above
+		// (they only strip `/private` while the path still exists), so fall
+		// back to pure prefix matching against the kernel-resolved root.
+		if hasDirectoryPrefix(absolutePath, realRootPath) {
+			let rel = absolutePath.dropFirst(realRootPath.count)
+			return .inside(relative: Self.trimPathSlashes(rel))
+		}
+		if hasDirectoryPrefix(standardizedAbsolute, realRootPath) {
+			let rel = standardizedAbsolute.dropFirst(realRootPath.count)
+			return .inside(relative: Self.trimPathSlashes(rel))
+		}
+
 		return .outside(originalAbsolute: standardizedAbsolute)
 	}
 

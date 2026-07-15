@@ -76,13 +76,71 @@ final class FileSystemServiceWorkspaceWatcherTests: XCTestCase {
 			}
 		}
 		XCTAssertTrue(sawModify, "expected a .modified event for seed.txt")
+	}
 
-		// Deletion events are NOT asserted: the engine's deletion-delta
-		// emission is a known-broken area that pre-dates the move
-		// (FileSystemServiceExtendedTests.testFileAndFolderDeletionEvents
-		// fails identically in RepoPrompt at the 0864184 baseline). The
-		// adapter maps fileRemoved/folderRemoved to .deleted when the engine
-		// does emit them.
+	func testDeletionsAreObserved() async throws {
+		let watcher = FileSystemServiceWorkspaceWatcher()
+		try await watcher.startWatching(root: tempDir)
+		defer { watcher.stopWatching() }
+
+		actor Log {
+			var events: [WorkspaceFileEvent] = []
+			func add(_ e: WorkspaceFileEvent) { events.append(e) }
+		}
+		let log = Log()
+		let recorder = Task { [events = watcher.events] in
+			for await event in events { await log.add(event) }
+		}
+		defer { recorder.cancel() }
+
+		// Give FSEvents a beat to arm before mutating.
+		try await Task.sleep(nanoseconds: 1_000_000_000)
+
+		func waitFor(_ predicate: @escaping ([WorkspaceFileEvent]) -> Bool) async -> Bool {
+			let deadline = Date().addingTimeInterval(20)
+			while Date() < deadline {
+				if predicate(await log.events) { return true }
+				try? await Task.sleep(nanoseconds: 250_000_000)
+			}
+			return predicate(await log.events)
+		}
+
+		func sawDeleted(_ name: String, in events: [WorkspaceFileEvent]) -> Bool {
+			events.contains {
+				if case .deleted(let url) = $0 { return url.lastPathComponent == name }
+				return false
+			}
+		}
+
+		// Create the doomed items while watching so the engine tracks them
+		// (deletion deltas are only emitted for known paths).
+		let doomedFile = tempDir.appendingPathComponent("doomed.txt")
+		try Data("bye".utf8).write(to: doomedFile)
+		let doomedFolder = tempDir.appendingPathComponent("doomed-folder", isDirectory: true)
+		try FileManager.default.createDirectory(at: doomedFolder, withIntermediateDirectories: true)
+		let doomedChild = doomedFolder.appendingPathComponent("child.txt")
+		try Data("child".utf8).write(to: doomedChild)
+
+		let tracked = await waitFor { events in
+			let created = Set(events.compactMap { event -> String? in
+				if case .created(let url) = event { return url.lastPathComponent }
+				return nil
+			})
+			return created.isSuperset(of: ["doomed.txt", "child.txt"])
+		}
+		XCTAssertTrue(tracked, "expected .created events for doomed.txt and child.txt before deleting")
+
+		try FileManager.default.removeItem(at: doomedFile)
+		try FileManager.default.removeItem(at: doomedFolder)
+
+		let sawFileDelete = await waitFor { sawDeleted("doomed.txt", in: $0) }
+		XCTAssertTrue(sawFileDelete, "expected a .deleted event for doomed.txt")
+
+		let sawFolderDelete = await waitFor { sawDeleted("doomed-folder", in: $0) }
+		XCTAssertTrue(sawFolderDelete, "expected a .deleted event for doomed-folder")
+
+		let sawChildDelete = await waitFor { sawDeleted("child.txt", in: $0) }
+		XCTAssertTrue(sawChildDelete, "expected a .deleted event for child.txt (subtree sweep must reach watcher consumers)")
 	}
 
 	func testStopFinishesStream() async throws {
