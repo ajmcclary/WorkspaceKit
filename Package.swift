@@ -15,7 +15,7 @@ let package = Package(
         .iOS(.v17)
     ],
     products: [
-        .library(name: "WorkspaceKit", targets: ["WorkspaceKit", "WorkspaceIgnore", "WorkspacePathsCore", "WorkspacePathLookup", "WorkspaceKitCSupport"])
+        .library(name: "WorkspaceKit", targets: ["WorkspaceKit", "WorkspaceIgnore", "WorkspacePathsCore", "WorkspacePathLookup", "WorkspaceSearch", "WorkspaceKitCSupport"])
     ],
     targets: [
         .target(name: "WorkspaceKit"),
@@ -26,6 +26,16 @@ let package = Package(
         // (RepoPromptCore precedent); the contracts target stays v6.
         .target(
             name: "WorkspaceIgnore",
+            dependencies: ["WorkspaceKitCSupport"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // Workspace file-search primitives (path search index, batch scorer,
+        // query parsing), promoted verbatim from RepoPrompt's
+        // Infrastructure/WorkspaceContext/Search in adoption slice 3. The
+        // repo_file_info / repo_score_matches_batch C backends live in
+        // WorkspaceKitCSupport (path_search.c, search_scoring.c).
+        .target(
+            name: "WorkspaceSearch",
             dependencies: ["WorkspaceKitCSupport"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
@@ -57,6 +67,11 @@ let package = Package(
         .testTarget(
             name: "WorkspacePathLookupTests",
             dependencies: ["WorkspacePathLookup"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "WorkspaceSearchTests",
+            dependencies: ["WorkspaceSearch"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
