@@ -92,11 +92,22 @@ public struct FSItemDTO: Sendable {
 	public let relativePath: String
 	public let isDirectory: Bool
 	public let hierarchy: Int
+
+	public init(relativePath: String, isDirectory: Bool, hierarchy: Int) {
+		self.relativePath = relativePath
+		self.isDirectory = isDirectory
+		self.hierarchy = hierarchy
+	}
 }
 
 public struct FSPreparedChunk: Sendable {
 	public let folders: [FSItemDTO]
 	public let files: [FSItemDTO]
+
+	public init(folders: [FSItemDTO], files: [FSItemDTO]) {
+		self.folders = folders
+		self.files = files
+	}
 }
 
 private struct FSEventCallbackEntry: Sendable {

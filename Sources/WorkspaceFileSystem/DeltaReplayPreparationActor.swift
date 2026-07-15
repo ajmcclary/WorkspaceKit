@@ -57,6 +57,22 @@ public struct PreparedFileSystemReplayChunkSummary: Sendable, Equatable {
 	public var fileModifiedCount: Int = 0
 	public var folderModifiedCount: Int = 0
 
+	public init(
+		fileAddedCount: Int = 0,
+		fileRemovedCount: Int = 0,
+		folderAddedCount: Int = 0,
+		folderRemovedCount: Int = 0,
+		fileModifiedCount: Int = 0,
+		folderModifiedCount: Int = 0
+	) {
+		self.fileAddedCount = fileAddedCount
+		self.fileRemovedCount = fileRemovedCount
+		self.folderAddedCount = folderAddedCount
+		self.folderRemovedCount = folderRemovedCount
+		self.fileModifiedCount = fileModifiedCount
+		self.folderModifiedCount = folderModifiedCount
+	}
+
 	public var modifiedCount: Int {
 		fileModifiedCount + folderModifiedCount
 	}
@@ -77,6 +93,24 @@ public struct PreparedFileSystemReplayBatch: Sendable {
 	public let chunks: [PreparedFileSystemReplayChunk]
 	public let coalesceDurationMS: Double
 	public let preparationDurationMS: Double
+
+	public init(
+		rootKey: String,
+		queuedDeltaCount: Int,
+		coalescedDeltaCount: Int,
+		preparedDeltas: [PreparedFileSystemDelta],
+		chunks: [PreparedFileSystemReplayChunk],
+		coalesceDurationMS: Double,
+		preparationDurationMS: Double
+	) {
+		self.rootKey = rootKey
+		self.queuedDeltaCount = queuedDeltaCount
+		self.coalescedDeltaCount = coalescedDeltaCount
+		self.preparedDeltas = preparedDeltas
+		self.chunks = chunks
+		self.coalesceDurationMS = coalesceDurationMS
+		self.preparationDurationMS = preparationDurationMS
+	}
 
 	public var discardedDeltaCount: Int {
 		max(queuedDeltaCount - coalescedDeltaCount, 0)
