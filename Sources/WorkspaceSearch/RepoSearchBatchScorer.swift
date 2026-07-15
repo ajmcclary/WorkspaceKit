@@ -3,10 +3,17 @@ import WorkspaceKitCSupport
 
 public struct RepoSearchBatchScorer {
 	public struct Candidate: Sendable {
-		let name: String
-		let path: String
-		let nameLower: String
-		let pathLower: String
+		public let name: String
+		public let path: String
+		public let nameLower: String
+		public let pathLower: String
+
+		public init(name: String, path: String, nameLower: String, pathLower: String) {
+			self.name = name
+			self.path = path
+			self.nameLower = nameLower
+			self.pathLower = pathLower
+		}
 	}
 
 	public static func scores(

@@ -9,9 +9,15 @@ public actor PathSearchIndex {
     // MARK: - Types
     
     public struct Candidate {
-        let index: Int
-        let path: String
-        let filename: String
+        public let index: Int
+        public let path: String
+        public let filename: String
+
+        public init(index: Int, path: String, filename: String) {
+            self.index = index
+            self.path = path
+            self.filename = filename
+        }
     }
     
     // MARK: - Private State
