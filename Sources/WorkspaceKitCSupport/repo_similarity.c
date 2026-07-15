@@ -305,3 +305,143 @@ double repo_similarity_score(const char *a, const char *b) {
     return 1.0 - (double)dist / (double)max_len;
 }
 
+
+char* repo_longest_common_subsequence(const char *a, const char *b) {
+    if (!a || !b) return NULL;
+    
+    /* Count UTF-8 characters and build position arrays */
+    size_t m = 0, n = 0;
+    const char *p;
+    
+    /* Count characters in a */
+    p = a;
+    while (*p) {
+        int char_len;
+        next_utf8_char(p, &char_len);
+        if (char_len == 0) break;
+        p += char_len;
+        m++;
+    }
+    
+    /* Count characters in b */
+    p = b;
+    while (*p) {
+        int char_len;
+        next_utf8_char(p, &char_len);
+        if (char_len == 0) break;
+        p += char_len;
+        n++;
+    }
+    
+    if (m == 0 || n == 0) {
+        return strdup("");
+    }
+    
+    /* Build character position arrays */
+    const char **a_chars = malloc(m * sizeof(char*));
+    int *a_lens = malloc(m * sizeof(int));
+    const char **b_chars = malloc(n * sizeof(char*));
+    int *b_lens = malloc(n * sizeof(int));
+    
+    if (!a_chars || !a_lens || !b_chars || !b_lens) {
+        free(a_chars); free(a_lens); free(b_chars); free(b_lens);
+        return NULL;
+    }
+    
+    /* Fill position arrays */
+    p = a;
+    for (size_t i = 0; i < m; i++) {
+        a_chars[i] = next_utf8_char(p, &a_lens[i]);
+        p += a_lens[i];
+    }
+    
+    p = b;
+    for (size_t i = 0; i < n; i++) {
+        b_chars[i] = next_utf8_char(p, &b_lens[i]);
+        p += b_lens[i];
+    }
+    
+    /* Allocate DP table */
+    int **dp = malloc((m + 1) * sizeof(int*));
+    if (!dp) {
+        free(a_chars); free(a_lens); free(b_chars); free(b_lens);
+        return NULL;
+    }
+    
+    for (size_t i = 0; i <= m; i++) {
+        dp[i] = calloc(n + 1, sizeof(int));
+        if (!dp[i]) {
+            for (size_t j = 0; j < i; j++) free(dp[j]);
+            free(dp);
+            free(a_chars); free(a_lens); free(b_chars); free(b_lens);
+            return NULL;
+        }
+    }
+    
+    /* Fill DP table */
+    for (size_t i = 1; i <= m; i++) {
+        for (size_t j = 1; j <= n; j++) {
+            if (utf8_chars_equal(a_chars[i-1], a_lens[i-1], b_chars[j-1], b_lens[j-1])) {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = (dp[i - 1][j] > dp[i][j - 1]) ? dp[i - 1][j] : dp[i][j - 1];
+            }
+        }
+    }
+    
+    /* Calculate space needed for LCS */
+    size_t lcs_char_count = dp[m][n];
+    size_t lcs_byte_size = 0;
+    
+    /* Backtrack to calculate byte size */
+    size_t i = m, j = n;
+    size_t *indices = malloc(lcs_char_count * sizeof(size_t));
+    size_t idx = lcs_char_count;
+    
+    while (i > 0 && j > 0) {
+        if (utf8_chars_equal(a_chars[i-1], a_lens[i-1], b_chars[j-1], b_lens[j-1])) {
+            indices[--idx] = i - 1;
+            lcs_byte_size += a_lens[i - 1];
+            i--;
+            j--;
+        } else if (dp[i - 1][j] > dp[i][j - 1]) {
+            i--;
+        } else {
+            j--;
+        }
+    }
+    
+    /* Build result string */
+    char *lcs = malloc(lcs_byte_size + 1);
+    if (!lcs) {
+        free(indices);
+        for (size_t k = 0; k <= m; k++) free(dp[k]);
+        free(dp);
+        free(a_chars); free(a_lens); free(b_chars); free(b_lens);
+        return NULL;
+    }
+    
+    char *dest = lcs;
+    for (size_t k = 0; k < lcs_char_count; k++) {
+        size_t char_idx = indices[k];
+        memcpy(dest, a_chars[char_idx], a_lens[char_idx]);
+        dest += a_lens[char_idx];
+    }
+    *dest = '\0';
+    
+    /* Clean up */
+    free(indices);
+    for (size_t k = 0; k <= m; k++) free(dp[k]);
+    free(dp);
+    free(a_chars); free(a_lens); free(b_chars); free(b_lens);
+    
+    return lcs;
+}
+
+/* MARK: - Similarity Score */
+
+/**
+ * Calculates similarity score based on algorithm selection
+ * For strings <= 64 chars: Uses Levenshtein distance
+ * For longer strings: Uses Dice coefficient
+ */

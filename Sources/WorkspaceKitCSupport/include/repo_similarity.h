@@ -20,6 +20,9 @@ double repo_dice_coefficient(const char *a, const char *b);
 /* Hybrid similarity: exact / capped-Levenshtein / Dice fallbacks. */
 double repo_similarity_score(const char *a, const char *b);
 
+/* Longest common subsequence (caller frees the returned string). */
+char* repo_longest_common_subsequence(const char *a, const char *b);
+
 #ifdef __cplusplus
 }
 #endif
