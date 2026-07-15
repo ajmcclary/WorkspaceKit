@@ -115,25 +115,25 @@ private struct FSEventCallbackPayload: Sendable {
 
 #if DEBUG
 public struct EventTargetIgnoreFastPathDiagnostics: Sendable, Equatable {
-	var unknownRegularFileDecisionCount = 0
-	var parentStateCacheHitCount = 0
-	var parentStateCacheMissCount = 0
-	var exactParentStateCount = 0
-	var unsupportedParentStateCount = 0
-	var directLeafCheckCount = 0
-	var directLeafIgnoredCount = 0
-	var fallbackFullTargetIgnoreCheckCount = 0
-	var fallbackFullTargetIgnoredCount = 0
-	var exactFullTargetIgnoreCheckCount = 0
-	var skippedKnownOrControlTargetIgnoreCheckCount = 0
+	public var unknownRegularFileDecisionCount = 0
+	public var parentStateCacheHitCount = 0
+	public var parentStateCacheMissCount = 0
+	public var exactParentStateCount = 0
+	public var unsupportedParentStateCount = 0
+	public var directLeafCheckCount = 0
+	public var directLeafIgnoredCount = 0
+	public var fallbackFullTargetIgnoreCheckCount = 0
+	public var fallbackFullTargetIgnoredCount = 0
+	public var exactFullTargetIgnoreCheckCount = 0
+	public var skippedKnownOrControlTargetIgnoreCheckCount = 0
 }
 
 public struct EventPathMappingFastPathDiagnostics: Sendable, Equatable {
-	var rawPathCount = 0
-	var fastStandardRootHitCount = 0
-	var fastCanonicalRootHitCount = 0
-	var fallbackStandardizationCount = 0
-	var rejectedUnsafePathCount = 0
+	public var rawPathCount = 0
+	public var fastStandardRootHitCount = 0
+	public var fastCanonicalRootHitCount = 0
+	public var fallbackStandardizationCount = 0
+	public var rejectedUnsafePathCount = 0
 }
 #endif
 
@@ -144,78 +144,78 @@ public struct PublishedDeltaCoalescingDiagnostics: Sendable, Equatable {
 }
 
 public struct CatalogEligibilityFallbackCounts: Sendable, Equatable {
-	var parentSymlinkComponent = 0
-	var directoryScanFailure = 0
-	var missingEntry = 0
-	var unknownEntryRegularFileMetadata = 0
-	var preparedIgnoreRulesFailure = 0
-	var preparedRuleMiss = 0
-	var invalidLeafName = 0
+	public var parentSymlinkComponent = 0
+	public var directoryScanFailure = 0
+	public var missingEntry = 0
+	public var unknownEntryRegularFileMetadata = 0
+	public var preparedIgnoreRulesFailure = 0
+	public var preparedRuleMiss = 0
+	public var invalidLeafName = 0
 }
 
 public struct CatalogEligibilityResultReasonCounts: Sendable, Equatable {
-	var eligible = 0
-	var invalidRelativePath = 0
-	var outsideRoot = 0
-	var missingOrDirectory = 0
-	var symbolicLink = 0
-	var nonRegularFile = 0
-	var symlinkComponent = 0
-	var outsideCanonicalRoot = 0
-	var ignored = 0
+	public var eligible = 0
+	public var invalidRelativePath = 0
+	public var outsideRoot = 0
+	public var missingOrDirectory = 0
+	public var symbolicLink = 0
+	public var nonRegularFile = 0
+	public var symlinkComponent = 0
+	public var outsideCanonicalRoot = 0
+	public var ignored = 0
 }
 
 public struct CatalogRegularFileEligibilityBatchDiagnostics: Sendable, Equatable {
-	var rawInputCount = 0
-	var uniqueStandardizedPathCount = 0
-	var resultCount = 0
-	var preparedRelativePathFastPathAttemptCount = 0
-	var preparedRelativePathFastPathUsedCount = 0
-	var preparedRelativePathFastPathFallbackCount = 0
-	var preparedRelativePathFastPathInputCount = 0
-	var preparedRelativePathFastPathGroupedEntryCount = 0
-	var preparedRelativePathFastPathParentReuseHitCount = 0
-	var preparedRelativePathFastPathParentReuseMissCount = 0
-	var parentGroupCount = 0
-	var maxParentGroupSize = 0
-	var standardizeAndGroupDurationMS = 0.0
-	var parentProcessingDurationMS = 0.0
-	var directoryScanGroupCount = 0
-	var directoryScanFailureGroupCount = 0
-	var directoryScanDurationMS = 0.0
-	var directoryEntryCount = 0
-	var entriesMapBuildDurationMS = 0.0
-	var canonicalParentResolveDurationMS = 0.0
-	var preparedIgnoreRulesGroupCount = 0
-	var preparedIgnoreRulesFailureGroupCount = 0
-	var preparedIgnoreRulesDurationMS = 0.0
-	var preparedIgnoreRulesCacheHitDirectoryCount = 0
-	var preparedIgnoreRulesCacheMissDirectoryCount = 0
-	var hierarchicalIgnoreCheckCount = 0
-	var hierarchicalIgnoreNoOpParentGroupCount = 0
-	var hierarchicalIgnoreSkippedLeafCheckCount = 0
-	var hierarchicalIgnoreDurationMS = 0.0
-	var prefixIgnoreCheckCount = 0
-	var prefixIgnoreNoOpParentGroupCount = 0
-	var prefixIgnoreSkippedLeafCheckCount = 0
-	var prefixIgnoreDurationMS = 0.0
-	var prefixDirectLeafFastPathParentGroupCount = 0
-	var prefixDirectLeafFastPathUnsupportedParentGroupCount = 0
-	var prefixDirectLeafFastPathLeafCheckCount = 0
-	var prefixDirectLeafFastPathIgnoredLeafCount = 0
-	var prefixDirectLeafFastPathCandidatePatternCountTotal = 0
-	var prefixDirectLeafFastPathCandidatePatternCountMax = 0
-	var prefixDirectLeafFastPathDurationMS = 0.0
-	var prefixParentRuleShapeGroupCount = 0
-	var prefixParentRuleDepthTotal = 0
-	var prefixParentRuleDepthMax = 0
-	var prefixParentActivePatternCountTotal = 0
-	var prefixParentActivePatternCountMax = 0
-	var prefixParentHasNegativePatternGroupCount = 0
-	var singleFileFallbackUniquePathCount = 0
-	var singleFileFallbackDurationMS = 0.0
-	var fallbackCounts = CatalogEligibilityFallbackCounts()
-	var resultReasonCounts = CatalogEligibilityResultReasonCounts()
+	public var rawInputCount = 0
+	public var uniqueStandardizedPathCount = 0
+	public var resultCount = 0
+	public var preparedRelativePathFastPathAttemptCount = 0
+	public var preparedRelativePathFastPathUsedCount = 0
+	public var preparedRelativePathFastPathFallbackCount = 0
+	public var preparedRelativePathFastPathInputCount = 0
+	public var preparedRelativePathFastPathGroupedEntryCount = 0
+	public var preparedRelativePathFastPathParentReuseHitCount = 0
+	public var preparedRelativePathFastPathParentReuseMissCount = 0
+	public var parentGroupCount = 0
+	public var maxParentGroupSize = 0
+	public var standardizeAndGroupDurationMS = 0.0
+	public var parentProcessingDurationMS = 0.0
+	public var directoryScanGroupCount = 0
+	public var directoryScanFailureGroupCount = 0
+	public var directoryScanDurationMS = 0.0
+	public var directoryEntryCount = 0
+	public var entriesMapBuildDurationMS = 0.0
+	public var canonicalParentResolveDurationMS = 0.0
+	public var preparedIgnoreRulesGroupCount = 0
+	public var preparedIgnoreRulesFailureGroupCount = 0
+	public var preparedIgnoreRulesDurationMS = 0.0
+	public var preparedIgnoreRulesCacheHitDirectoryCount = 0
+	public var preparedIgnoreRulesCacheMissDirectoryCount = 0
+	public var hierarchicalIgnoreCheckCount = 0
+	public var hierarchicalIgnoreNoOpParentGroupCount = 0
+	public var hierarchicalIgnoreSkippedLeafCheckCount = 0
+	public var hierarchicalIgnoreDurationMS = 0.0
+	public var prefixIgnoreCheckCount = 0
+	public var prefixIgnoreNoOpParentGroupCount = 0
+	public var prefixIgnoreSkippedLeafCheckCount = 0
+	public var prefixIgnoreDurationMS = 0.0
+	public var prefixDirectLeafFastPathParentGroupCount = 0
+	public var prefixDirectLeafFastPathUnsupportedParentGroupCount = 0
+	public var prefixDirectLeafFastPathLeafCheckCount = 0
+	public var prefixDirectLeafFastPathIgnoredLeafCount = 0
+	public var prefixDirectLeafFastPathCandidatePatternCountTotal = 0
+	public var prefixDirectLeafFastPathCandidatePatternCountMax = 0
+	public var prefixDirectLeafFastPathDurationMS = 0.0
+	public var prefixParentRuleShapeGroupCount = 0
+	public var prefixParentRuleDepthTotal = 0
+	public var prefixParentRuleDepthMax = 0
+	public var prefixParentActivePatternCountTotal = 0
+	public var prefixParentActivePatternCountMax = 0
+	public var prefixParentHasNegativePatternGroupCount = 0
+	public var singleFileFallbackUniquePathCount = 0
+	public var singleFileFallbackDurationMS = 0.0
+	public var fallbackCounts = CatalogEligibilityFallbackCounts()
+	public var resultReasonCounts = CatalogEligibilityResultReasonCounts()
 }
 
 private enum CatalogEligibilityFallbackReason {
