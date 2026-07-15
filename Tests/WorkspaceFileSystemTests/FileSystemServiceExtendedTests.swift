@@ -52,8 +52,6 @@ final class FileSystemServiceExtendedTests: XCTestCase {
     // MARK: - Deletion Event Tests
     
     func testFileAndFolderDeletionEvents() async throws {
-    
-    	throw XCTSkip("Pre-existing failure imported with the WorkspaceKit adoption moves: fails identically in RepoPrompt at 0864184 (pre-slice-3 baseline, 2026-07-15).")
         let fs = SpyFS()
         
         // Create initial structure
@@ -110,8 +108,6 @@ final class FileSystemServiceExtendedTests: XCTestCase {
     // MARK: - Folder Rename Tests
     
     func testFolderRenameUpdatesAllChildren() async throws {
-    
-    	throw XCTSkip("Pre-existing failure imported with the WorkspaceKit adoption moves: fails identically in RepoPrompt at 0864184 (pre-slice-3 baseline, 2026-07-15).")
         let fs = SpyFS()
         
         // Create folder structure

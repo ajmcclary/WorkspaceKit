@@ -1972,7 +1972,11 @@ public actor FileSystemService {
 	#endif
 
 	private func coalescedPublishableDeltas(from deltas: [FileSystemDelta]) -> [FileSystemDelta] {
-		FileSystemDeltaPreparation.coalesce(deltas, inRoot: canonicalRootPath)
+		FileSystemDeltaPreparation.coalesce(
+			deltas,
+			inRoot: canonicalRootPath,
+			preservingDescendantRemovals: true
+		)
 	}
 	
 	// MARK: - FSEvent Setup
