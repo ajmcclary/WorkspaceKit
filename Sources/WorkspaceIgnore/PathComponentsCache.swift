@@ -7,6 +7,8 @@ import Foundation
 /// expected to discard the instance afterwards to keep memory bounded.
 public struct PathComponentsCache {
     
+    public init() {}
+
     private var storage = [String: [Substring]]()
     
     /// Return the cached components for `path`, computing and storing

@@ -1,6 +1,8 @@
 import Foundation
 
 public struct IgnoreCacheStore {
+	public init() {}
+
 	public static let finalIgnoreCacheCapacity = 50_000
 	
 	/// Compact key used by all internal caches – avoids repeated String concatenation.
