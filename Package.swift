@@ -15,7 +15,7 @@ let package = Package(
         .iOS(.v17)
     ],
     products: [
-        .library(name: "WorkspaceKit", targets: ["WorkspaceKit", "WorkspaceIgnore", "WorkspacePathsCore", "WorkspacePathLookup", "WorkspaceSearch", "WorkspaceKitCSupport"])
+        .library(name: "WorkspaceKit", targets: ["WorkspaceKit", "WorkspaceIgnore", "WorkspacePathsCore", "WorkspacePathLookup", "WorkspaceSearch", "WorkspaceFileSystem", "WorkspaceKitCSupport"])
     ],
     targets: [
         .target(name: "WorkspaceKit"),
@@ -27,6 +27,16 @@ let package = Package(
         .target(
             name: "WorkspaceIgnore",
             dependencies: ["WorkspaceKitCSupport"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // The workspace scan/watch/delta engine: the FileSystemService actor
+        // promoted from RepoPrompt in adoption slice 4. Content decoding
+        // rides the WorkspaceCharsetDetecting seam (CharsetDetection.swift)
+        // so the Cuchardet/UniversalCharsetDetection third-party backends
+        // stay app-side and this package stays zero-dependency.
+        .target(
+            name: "WorkspaceFileSystem",
+            dependencies: ["WorkspaceIgnore", "WorkspacePathsCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Workspace file-search primitives (path search index, batch scorer,
@@ -72,6 +82,11 @@ let package = Package(
         .testTarget(
             name: "WorkspaceSearchTests",
             dependencies: ["WorkspaceSearch"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "WorkspaceFileSystemTests",
+            dependencies: ["WorkspaceFileSystem"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
