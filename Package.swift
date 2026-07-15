@@ -36,7 +36,7 @@ let package = Package(
         // stay app-side and this package stays zero-dependency.
         .target(
             name: "WorkspaceFileSystem",
-            dependencies: ["WorkspaceIgnore", "WorkspacePathsCore"],
+            dependencies: ["WorkspaceKit", "WorkspaceIgnore", "WorkspacePathsCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Workspace file-search primitives (path search index, batch scorer,
