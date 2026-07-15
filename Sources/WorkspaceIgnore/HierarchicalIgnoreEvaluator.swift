@@ -5,7 +5,7 @@ import Foundation
 public final class HierarchicalIgnoreEvaluator {
     
     /// A provider of ignore rules for a given directory path
-    protocol RulesProvider {
+    public protocol RulesProvider {
         /// Get the effective ignore rules for a directory
         /// - Parameters:
         ///   - directoryPath: The relative path to the directory (empty string for root)
@@ -15,7 +15,7 @@ public final class HierarchicalIgnoreEvaluator {
     
     private let rulesProvider: RulesProvider
     
-    init(rulesProvider: RulesProvider) {
+    public init(rulesProvider: RulesProvider) {
         self.rulesProvider = rulesProvider
     }
     
@@ -24,7 +24,7 @@ public final class HierarchicalIgnoreEvaluator {
     ///   - relativePath: The relative path to check
     ///   - isDirectory: Whether the final component is a directory
     /// - Returns: true if the path or any parent directory is ignored
-    func isIgnored(relativePath: String, isDirectory: Bool) async throws -> Bool {
+    public func isIgnored(relativePath: String, isDirectory: Bool) async throws -> Bool {
         let components = relativePath.split(separator: "/").map(String.init)
         return try await isIgnored(components: components, isDirectory: isDirectory)
     }
@@ -102,7 +102,7 @@ public final class CachedRulesProvider: HierarchicalIgnoreEvaluator.RulesProvide
     private let rootRules: IgnoreRules
     private let fallbackProvider: ((String) async throws -> IgnoreRules)?
     
-    init(
+    public init(
         cache: [String: IgnoreRules],
         rootRules: IgnoreRules,
         fallbackProvider: ((String) async throws -> IgnoreRules)? = nil
@@ -112,7 +112,7 @@ public final class CachedRulesProvider: HierarchicalIgnoreEvaluator.RulesProvide
         self.fallbackProvider = fallbackProvider
     }
     
-    func rulesForDirectory(_ directoryPath: String) async throws -> IgnoreRules {
+    public func rulesForDirectory(_ directoryPath: String) async throws -> IgnoreRules {
         // Check cache first
         if let cached = cache[directoryPath] {
 			#if DEBUG

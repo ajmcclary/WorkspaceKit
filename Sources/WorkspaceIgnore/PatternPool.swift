@@ -9,7 +9,7 @@ import Foundation
 /// here because pattern compilation happens far less frequently than pattern
 /// matching.
 public final class PatternPool {
-    static let shared = PatternPool()
+    public static let shared = PatternPool()
 
     private var set = Set<String>()
     private let lock = NSLock()
@@ -25,7 +25,7 @@ public final class PatternPool {
     /// pool reaches its maximum unique-string count, it is cleared before
     /// inserting the next new string. Clearing only reduces future deduplication;
     /// compiled rules already hold independent `String` values.
-    func intern(_ pattern: String) -> String {
+    public func intern(_ pattern: String) -> String {
         lock.lock()
         defer { lock.unlock() }
 
@@ -42,17 +42,17 @@ public final class PatternPool {
     }
 
     #if DEBUG
-    var countForTesting: Int {
+    public var countForTesting: Int {
         lock.lock()
         defer { lock.unlock() }
         return set.count
     }
 
-    var capacityForTesting: Int {
+    public var capacityForTesting: Int {
         maxEntries
     }
 
-    func resetForTesting() {
+    public func resetForTesting() {
         lock.lock()
         defer { lock.unlock() }
         set.removeAll(keepingCapacity: false)

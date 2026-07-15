@@ -11,7 +11,7 @@ public struct PathComponentsCache {
     
     /// Return the cached components for `path`, computing and storing
     /// them on first request.
-    mutating func components(for path: String) -> [Substring] {
+    public mutating func components(for path: String) -> [Substring] {
         if let cached = storage[path] {
             return cached
         }
@@ -21,7 +21,7 @@ public struct PathComponentsCache {
     }
     
     /// Clear all cached entries.
-    mutating func removeAll() {
+    public mutating func removeAll() {
         storage.removeAll()
     }
 }

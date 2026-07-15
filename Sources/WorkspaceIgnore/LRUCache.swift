@@ -27,13 +27,13 @@ public struct LRUCache<Key: Hashable, Value> {
     private var tail: Node?   // Least recently used
     
     // MARK: - Init
-    init(capacity: Int) {
+    public init(capacity: Int) {
         precondition(capacity > 0, "LRUCache capacity must be > 0")
         self.capacity = capacity
     }
     
     // MARK: - Public API
-    subscript(key: Key) -> Value? {
+    public subscript(key: Key) -> Value? {
         mutating get { value(forKey: key) }
         mutating set {
             if let newVal = newValue {
@@ -44,15 +44,15 @@ public struct LRUCache<Key: Hashable, Value> {
         }
     }
 
-    var count: Int {
+    public var count: Int {
         dict.count
     }
 
-    var keys: [Key] {
+    public var keys: [Key] {
         Array(dict.keys)
     }
 
-    func snapshot() -> [Key: Value] {
+    public func snapshot() -> [Key: Value] {
         var snapshot: [Key: Value] = [:]
         snapshot.reserveCapacity(dict.count)
         for (key, node) in dict {
@@ -62,12 +62,12 @@ public struct LRUCache<Key: Hashable, Value> {
     }
 
     @discardableResult
-    mutating func set(_ value: Value, forKey key: Key) -> Key? {
+    public mutating func set(_ value: Value, forKey key: Key) -> Key? {
         insert(key: key, value: value)
     }
     
     /// Clear all stored entries.
-    mutating func removeAll() {
+    public mutating func removeAll() {
         var node = head
         while let current = node {
             let next = current.next
@@ -111,7 +111,7 @@ public struct LRUCache<Key: Hashable, Value> {
         return nil
     }
     
-    mutating func removeValue(forKey key: Key) {
+    public mutating func removeValue(forKey key: Key) {
         guard let node = dict[key] else { return }
         dict.removeValue(forKey: key)
         removeNode(node)
