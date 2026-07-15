@@ -388,6 +388,11 @@ public struct PathLocateOptions: Sendable, Equatable {
 public struct FileCreationResult: Sendable {
     public let rootFolder: FolderRecord
     public let componentsToCreate: [String]
+
+    public init(rootFolder: FolderRecord, componentsToCreate: [String]) {
+        self.rootFolder = rootFolder
+        self.componentsToCreate = componentsToCreate
+    }
 }
 
 extension FileCreationResult: Equatable {

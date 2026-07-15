@@ -19,7 +19,7 @@ public struct SelectionSig: Equatable, Sendable {
 /// Note: Previous implementation used rotate after XOR which made the result
 /// order-dependent. This version uses separate XOR and sum accumulators
 /// that are truly commutative.
-func selectionSignature(for paths: Set<String>) -> SelectionSig {
+public func selectionSignature(for paths: Set<String>) -> SelectionSig {
     guard !paths.isEmpty else { return .empty }
     
     var xorAcc: UInt64 = 0
