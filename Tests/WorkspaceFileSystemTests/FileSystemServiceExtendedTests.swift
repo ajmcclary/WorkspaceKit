@@ -103,6 +103,16 @@ final class FileSystemServiceExtendedTests: XCTestCase {
         
         XCTAssertTrue(removedPaths.contains("docs"), "Should remove the folder")
         XCTAssertTrue(removedPaths.contains("docs/readme.md"), "Should remove files in deleted folder")
+
+        // Pin visited-state transitions: deletion sweeps the subtree out of
+        // visitedPaths/visitedItems and leaves siblings untouched.
+        let state = await service.getTestState()
+        XCTAssertFalse(state.visitedPaths.contains("src/main.swift"), "Deleted file should leave visitedPaths")
+        XCTAssertFalse(state.visitedPaths.contains("docs"), "Deleted folder should leave visitedPaths")
+        XCTAssertFalse(state.visitedPaths.contains("docs/readme.md"), "Deleted folder's children should leave visitedPaths")
+        XCTAssertNil(state.visitedItems["docs"], "Deleted folder should leave visitedItems")
+        XCTAssertNil(state.visitedItems["docs/readme.md"], "Deleted folder's children should leave visitedItems")
+        XCTAssertTrue(state.visitedPaths.contains("src"), "Sibling folder must stay tracked")
     }
     
     // MARK: - Folder Rename Tests
@@ -166,6 +176,190 @@ final class FileSystemServiceExtendedTests: XCTestCase {
         XCTAssertTrue(removedPaths.contains("old-name/file1.txt"), "Files in old folder should be removed")
         XCTAssertTrue(addedPaths.contains("new-name"), "New folder should be added")
         XCTAssertTrue(addedPaths.contains("new-name/file1.txt"), "Files in new folder should be added")
+
+        // Pin visited-state transitions: the paired rename sweeps the old
+        // subtree and tracks the new folder plus its scanned first level.
+        let state = await service.getTestState()
+        for stale in ["old-name", "old-name/sub", "old-name/file1.txt", "old-name/sub/file2.txt"] {
+            XCTAssertFalse(state.visitedPaths.contains(stale), "\(stale) should leave visitedPaths after rename")
+            XCTAssertNil(state.visitedItems[stale], "\(stale) should leave visitedItems after rename")
+        }
+        XCTAssertTrue(state.visitedPaths.contains("new-name"), "Renamed folder should be tracked")
+        XCTAssertEqual(state.visitedItems["new-name"], true)
+        XCTAssertTrue(state.visitedPaths.contains("new-name/file1.txt"), "Scan of renamed folder should track its files")
+    }
+
+    // MARK: - Paired Rename / Move / Atomic Save Pinning
+
+    func testPairedFileRenameEmitsRemoveAndAdd() async throws {
+        let fs = SpyFS()
+        fs.addFile("/test/repo/before.txt")
+
+        let service = try await createTestService(
+            fs: fs,
+            visitedPaths: ["before.txt"],
+            visitedItems: ["before.txt": false]
+        )
+
+        fs.remove("/test/repo/before.txt")
+        fs.addFile("/test/repo/after.txt")
+
+        let deltas = await service.simulateFSEvents([
+            createFSEvent(
+                path: "/test/repo/before.txt",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemRemoved)
+            ),
+            createFSEvent(
+                path: "/test/repo/after.txt",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemCreated)
+            )
+        ])
+
+        XCTAssertTrue(deltas.contains { delta in
+            if case .fileRemoved("before.txt") = delta { return true }
+            return false
+        }, "Rename source should be removed")
+        XCTAssertTrue(deltas.contains { delta in
+            if case .fileAdded("after.txt") = delta { return true }
+            return false
+        }, "Rename destination should be added")
+
+        let state = await service.getTestState()
+        XCTAssertFalse(state.visitedPaths.contains("before.txt"))
+        XCTAssertTrue(state.visitedPaths.contains("after.txt"))
+        XCTAssertEqual(state.visitedItems["after.txt"], false)
+    }
+
+    func testRenameOnlyEventForMissingKnownFolderRemovesSubtree() async throws {
+        let fs = SpyFS()
+        fs.addFolder("/test/repo/stale")
+        fs.addFile("/test/repo/stale/file.txt")
+
+        let service = try await createTestService(
+            fs: fs,
+            visitedPaths: ["stale", "stale/file.txt"],
+            visitedItems: ["stale": true, "stale/file.txt": false]
+        )
+
+        // Finder trash / cross-directory moves deliver Renamed WITHOUT
+        // Created or Removed; the path no longer exists at this location.
+        fs.remove("/test/repo/stale")
+        fs.remove("/test/repo/stale/file.txt")
+
+        let deltas = await service.simulateFSEvents([
+            createFSEvent(
+                path: "/test/repo/stale",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemIsDir)
+            )
+        ])
+
+        let removedPaths = deltas.compactMap { delta -> String? in
+            switch delta {
+            case .fileRemoved(let path), .folderRemoved(let path):
+                return path
+            default:
+                return nil
+            }
+        }
+        XCTAssertTrue(removedPaths.contains("stale"), "Moved-away folder should be removed")
+        XCTAssertTrue(removedPaths.contains("stale/file.txt"), "Moved-away folder's children should be removed")
+
+        let state = await service.getTestState()
+        XCTAssertFalse(state.visitedPaths.contains("stale"))
+        XCTAssertFalse(state.visitedPaths.contains("stale/file.txt"))
+    }
+
+    func testRenameOnlyEventForExistingUnknownFileAddsIt() async throws {
+        let fs = SpyFS()
+        let service = try await createTestService(fs: fs)
+
+        fs.addFile("/test/repo/arrived.txt")
+
+        let deltas = await service.simulateFSEvents([
+            createFSEvent(
+                path: "/test/repo/arrived.txt",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed)
+            )
+        ])
+
+        XCTAssertTrue(deltas.contains { delta in
+            if case .fileAdded("arrived.txt") = delta { return true }
+            return false
+        }, "File moved into the root should be added")
+
+        let state = await service.getTestState()
+        XCTAssertTrue(state.visitedPaths.contains("arrived.txt"))
+        XCTAssertEqual(state.visitedItems["arrived.txt"], false)
+    }
+
+    func testAtomicSaveOnKnownFileEmitsModification() async throws {
+        let fs = SpyFS()
+        fs.addFile("/test/repo/notes.txt")
+
+        let service = try await createTestService(
+            fs: fs,
+            visitedPaths: ["notes.txt"],
+            visitedItems: ["notes.txt": false]
+        )
+
+        // Editor atomic save: temp file renamed over the real path, so the
+        // known path gets Renamed+Created and still exists on disk.
+        let deltas = await service.simulateFSEvents([
+            createFSEvent(
+                path: "/test/repo/notes.txt",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemCreated)
+            )
+        ])
+
+        XCTAssertTrue(deltas.contains { delta in
+            if case .fileModified("notes.txt", _) = delta { return true }
+            return false
+        }, "Atomic save should surface as a modification")
+        XCTAssertFalse(deltas.contains { delta in
+            if case .fileAdded = delta { return true }
+            return false
+        }, "Atomic save must not re-add the file")
+        XCTAssertFalse(deltas.contains { delta in
+            if case .fileRemoved = delta { return true }
+            return false
+        }, "Atomic save must not remove the file")
+
+        let state = await service.getTestState()
+        XCTAssertTrue(state.visitedPaths.contains("notes.txt"))
+    }
+
+    func testMoveAwayOfKnownFileEmitsRemoval() async throws {
+        let fs = SpyFS()
+        fs.addFile("/test/repo/leaving.txt")
+
+        let service = try await createTestService(
+            fs: fs,
+            visitedPaths: ["leaving.txt"],
+            visitedItems: ["leaving.txt": false]
+        )
+
+        // Trash / mv-out delivers the same Renamed+Created pair as an atomic
+        // save, but the file is gone — the disk check disambiguates.
+        fs.remove("/test/repo/leaving.txt")
+
+        let deltas = await service.simulateFSEvents([
+            createFSEvent(
+                path: "/test/repo/leaving.txt",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemCreated)
+            )
+        ])
+
+        XCTAssertTrue(deltas.contains { delta in
+            if case .fileRemoved("leaving.txt") = delta { return true }
+            return false
+        }, "Move-away should surface as a removal")
+        XCTAssertFalse(deltas.contains { delta in
+            if case .fileModified("leaving.txt", _) = delta { return true }
+            return false
+        }, "Move-away must not surface as a modification (coalescer drops the transient modify)")
+
+        let state = await service.getTestState()
+        XCTAssertFalse(state.visitedPaths.contains("leaving.txt"))
     }
     
     // MARK: - Concurrent Event Processing
