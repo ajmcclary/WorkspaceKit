@@ -89,26 +89,26 @@ public enum CatalogRegularFileEligibility: Sendable, Equatable {
 }
 
 public struct FSItemDTO: Sendable {
-	let relativePath: String
-	let isDirectory: Bool
-	let hierarchy: Int
+	public let relativePath: String
+	public let isDirectory: Bool
+	public let hierarchy: Int
 }
 
 public struct FSPreparedChunk: Sendable {
-	let folders: [FSItemDTO]
-	let files: [FSItemDTO]
+	public let folders: [FSItemDTO]
+	public let files: [FSItemDTO]
 }
 
 private struct FSEventCallbackEntry: Sendable {
-	let path: String
-	let flags: FSEventStreamEventFlags
-	let id: FSEventStreamEventId
+	public let path: String
+	public let flags: FSEventStreamEventFlags
+	public let id: FSEventStreamEventId
 }
 
 private struct FSEventCallbackPayload: Sendable {
-	let entries: [FSEventCallbackEntry]
+	public let entries: [FSEventCallbackEntry]
 
-	var count: Int {
+	public var count: Int {
 		entries.count
 	}
 }
@@ -139,8 +139,8 @@ public struct EventPathMappingFastPathDiagnostics: Sendable, Equatable {
 
 #if DEBUG
 public struct PublishedDeltaCoalescingDiagnostics: Sendable, Equatable {
-	let rawDeltaCount: Int
-	let publishedDeltaCount: Int
+	public let rawDeltaCount: Int
+	public let publishedDeltaCount: Int
 }
 
 public struct CatalogEligibilityFallbackCounts: Sendable, Equatable {
@@ -334,7 +334,7 @@ public actor FileSystemService {
 	/// Injected charset-detection backend (adoption slice 4 seam) — the app
 	/// supplies a Cuchardet-backed detector; the default uses Foundation
 	/// heuristics only.
-	let charsetDetector: any WorkspaceCharsetDetecting
+	public let charsetDetector: any WorkspaceCharsetDetecting
 
 	private let fileManager = FileManager.default
 	private static let maxPendingRawEvents = 50_000
@@ -396,7 +396,7 @@ public actor FileSystemService {
 	private var encodingMap = [String: String.Encoding]()
 	
 	/// Path we are managing
-	let path: String
+	public let path: String
 	private let rootURL: URL
 	private let canonicalRootURL: URL
 	private var canonicalRootPath: String { canonicalRootURL.path }
@@ -6187,8 +6187,8 @@ public extension URL {
 
 /// Bundles the decoded text with the encoding that produced it.
 public struct DetectedText {
-	let string: String
-	let encoding: String.Encoding
+	public let string: String
+	public let encoding: String.Encoding
 }
 
 /// Convert an IANA charset label (e.g. "windows-1252") to `String.Encoding`.
@@ -6224,8 +6224,8 @@ private func detectEncodingFull(_ data: Data, detector: any WorkspaceCharsetDete
 public extension FileSystemService {
 	/// Physical directory identity (stable for cycle checks).
 	public struct DirID: Hashable, Sendable {
-		let dev: UInt64
-		let ino: UInt64
+		public let dev: UInt64
+		public let ino: UInt64
 	}
 	
 	/// `stat()` follows symlinks → this returns the target directory identity.
