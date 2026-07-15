@@ -6,8 +6,8 @@ import WorkspacePathsCore
 /// Pure-value result coming from the background PathMatcher.
 /// No actor references – therefore `Sendable` by default.
 public struct PathMatchLocation: Sendable {
-    let rootPath: String      // absolute path of the owning repo root
-    let correctedPath: String // final relative path inside that root
+    public let rootPath: String      // absolute path of the owning repo root
+    public let correctedPath: String // final relative path inside that root
 }
 
 // MARK: - Immutable Snapshot Types
@@ -16,20 +16,20 @@ public struct PathMatchLocation: Sendable {
 /// Immutable, cross-actor-safe snapshot used by PathMatcher and PathMatchWorker.
 /// All references to UI/ViewModel types are stripped; uses frozen records only.
 public struct StaticPathMatchData: Sendable {
-    let filesByFullPath: [String: FileRecord]
-    let foldersByFullPath: [String: FolderRecord]
-    let rootFolders: [FolderRecord]
+    public let filesByFullPath: [String: FileRecord]
+    public let foldersByFullPath: [String: FolderRecord]
+    public let rootFolders: [FolderRecord]
     
     // Case-insensitive dictionaries (no duplicates in original maps)
-    let filesByLowerFullPath: [String: FileRecord]
-    let foldersByLowerFullPath: [String: FolderRecord]
+    public let filesByLowerFullPath: [String: FileRecord]
+    public let foldersByLowerFullPath: [String: FolderRecord]
     
     // Matching policy - current default is case-insensitive
-    let caseSensitive: Bool
+    public let caseSensitive: Bool
     
     /// Monotonic id to allow caching of indexes per snapshot generation.
     /// Bumped by RepoFileManagerViewModel when the file hierarchy changes.
-    let id: UInt64
+    public let id: UInt64
     
     public init(
         filesByFullPath: [String: FileRecord],
@@ -69,22 +69,22 @@ public struct StaticPathMatchData: Sendable {
 /// Immutable snapshot of file hierarchy state for path matching.
 /// All references to UI/ViewModel types are stripped; uses frozen records only.
 public struct PathMatchSnapshot: Sendable {
-    let filesByFullPath: [String: FileRecord]
-    let foldersByFullPath: [String: FolderRecord]
-    let rootFolders: [FolderRecord]
+    public let filesByFullPath: [String: FileRecord]
+    public let foldersByFullPath: [String: FolderRecord]
+    public let rootFolders: [FolderRecord]
     
     // Case-insensitive dictionaries copied from StaticPathMatchData or computed on the fly
-    let filesByLowerFullPath: [String: FileRecord]
-    let foldersByLowerFullPath: [String: FolderRecord]
+    public let filesByLowerFullPath: [String: FileRecord]
+    public let foldersByLowerFullPath: [String: FolderRecord]
     
-    let selectedFileFullPaths: Set<String>
+    public let selectedFileFullPaths: Set<String>
     
     /// Fully computed indexes – no internal locking, built on the worker actor.
     private let storedIndexes: PathMatchIndexes
-    var indexes: PathMatchIndexes { storedIndexes }
+    public var indexes: PathMatchIndexes { storedIndexes }
     
     /// Matching policy flag (current default is case-insensitive)
-    let caseSensitive: Bool
+    public let caseSensitive: Bool
     
     /// Primary initializer used by PathMatchWorker.
     /// Accepts pre-computed indexes from the worker's cache.
@@ -231,10 +231,10 @@ public extension PathMatchSnapshot {
 }
 
 public struct PathMatchIndexes: Sendable {
-    let byFileName: [String: [FileRecord]]
-    let byLastTwo: [String: [FileRecord]]
-    let byExtension: [String: [FileRecord]]
-    let foldersByLastComponent: [String: [FolderRecord]]
+    public let byFileName: [String: [FileRecord]]
+    public let byLastTwo: [String: [FileRecord]]
+    public let byExtension: [String: [FileRecord]]
+    public let foldersByLastComponent: [String: [FolderRecord]]
     
     public static func canonical(_ s: String, caseSensitive: Bool) -> String {
         // Quick ASCII probe: if all bytes < 0x80, skip folding entirely
@@ -386,8 +386,8 @@ public struct PathLocateOptions: Sendable, Equatable {
 
 /// Result of finding a path for file creation
 public struct FileCreationResult: Sendable {
-    let rootFolder: FolderRecord
-    let componentsToCreate: [String]
+    public let rootFolder: FolderRecord
+    public let componentsToCreate: [String]
 }
 
 extension FileCreationResult: Equatable {
