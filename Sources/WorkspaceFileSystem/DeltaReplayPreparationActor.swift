@@ -83,6 +83,18 @@ public struct PreparedFileSystemReplayChunk: Sendable, Equatable {
 	public let deltaCount: Int
 	public let summary: PreparedFileSystemReplayChunkSummary
 	public let renameTransfers: [PreparedFolderRenameTransfer]
+
+	public init(
+		range: Range<Int>,
+		deltaCount: Int,
+		summary: PreparedFileSystemReplayChunkSummary,
+		renameTransfers: [PreparedFolderRenameTransfer]
+	) {
+		self.range = range
+		self.deltaCount = deltaCount
+		self.summary = summary
+		self.renameTransfers = renameTransfers
+	}
 }
 
 public struct PreparedFileSystemReplayBatch: Sendable {
