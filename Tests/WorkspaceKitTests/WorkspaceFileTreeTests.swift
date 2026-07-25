@@ -3,7 +3,7 @@ import Testing
 @testable import WorkspaceKit
 
 /// Characterization tests pinning the behavior the contracts and the macOS
-/// adapter shipped with when they moved out of CodeEditorPlugin's
+/// adapter shipped with when they moved out of CodeEditorKit's
 /// CodeEditorWorkspace target (workspace decomposition step 5).
 @Suite("WorkspaceFileNode + WorkspaceFileTree")
 struct WorkspaceFileTreeTests {

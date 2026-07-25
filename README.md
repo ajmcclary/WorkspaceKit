@@ -21,6 +21,6 @@ Also ships:
 Zero external dependencies. Contracts target is Swift 6 strict concurrency.
 Floors: macOS 14 / iOS 17.
 
-Consumers: `CodeEditorPlugin` (its `CodeEditorWorkspace` product is an
+Consumers: `CodeEditorKit` (its `CodeEditorWorkspace` product is an
 `@_exported` shim over this package) and, through that shim, the CodeEditor
 workspace's `CodeEditorDemo` app.

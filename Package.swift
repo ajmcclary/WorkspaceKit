@@ -3,8 +3,8 @@ import PackageDescription
 
 // WorkspaceKit — neutral workspace file-tree contracts + adapters.
 //
-// Promoted out of CodeEditorPlugin's CodeEditorWorkspace target (workspace
-// decomposition step 5). CodeEditorPlugin's CodeEditorWorkspace product is
+// Promoted out of CodeEditorKit's CodeEditorWorkspace target (workspace
+// decomposition step 5). CodeEditorKit's CodeEditorWorkspace product is
 // now an @_exported re-export shim over this package; apps/CodeEditorDemo
 // consumes the contracts through that shim. Zero dependencies; the
 // MacOSWorkspaceFileManager adapter is #if canImport(AppKit)-gated.
