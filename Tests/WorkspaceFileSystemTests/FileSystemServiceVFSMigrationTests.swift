@@ -253,4 +253,79 @@ final class FileSystemServiceVFSMigrationTests: XCTestCase {
         let deltas2 = await service.simulateFSEvents([event2])
         XCTAssertTrue(deltas2.isEmpty, "With new ignore rules, new files in temp/ should be filtered")
     }
+
+    // MARK: - Cross-isolation ownership of the TestFS seam
+
+    /// Regression coverage for `TestFSTransfer` (the one `@unchecked Sendable`
+    /// box in WorkspaceIgnore). One `InMemoryFS` double is deliberately shared
+    /// by three isolation domains at once:
+    ///
+    /// 1. the `FileSystemService` actor (directory enumeration / attributes),
+    /// 2. the `IgnoreRulesManager` actor — which only sees the virtual
+    ///    `.gitignore` if the double actually crossed the boundary during
+    ///    `FileSystemService.init`, and
+    /// 3. plain concurrent tasks mutating and querying the double directly.
+    ///
+    /// The ignore assertion is the proof that (2) happened: `vendor/` is only
+    /// ignorable if `IgnoreRulesManager` read the `.gitignore` out of the same
+    /// virtual tree. The positive control rules out "empty because nothing was
+    /// processed".
+    func testVirtualFSOverrideIsSharedSafelyAcrossIsolationDomains() async throws {
+        let fs = InMemoryFS()
+        fs.addFolder("/tmp/test/vendor")
+        fs.addFile("/tmp/test/vendor/lib.js")
+        fs.addFolder("/tmp/test/src")
+        fs.addFile("/tmp/test/src/app.swift")
+
+        let service = try await createTestService(
+            visitedPaths: [],
+            visitedItems: [:],
+            ignorePatterns: ["vendor/"],
+            fs: fs
+        )
+
+        // Hammer the same double from 64 unstructured tasks while the two
+        // actors above are also reading it.
+        let hammer = Task.detached {
+            await withTaskGroup(of: Bool.self) { group in
+                for i in 0..<64 {
+                    group.addTask {
+                        let path = "/tmp/test/src/gen\(i).swift"
+                        fs.addFile(path)
+                        var isDir: ObjCBool = false
+                        return fs.fileExists(atPath: path, isDirectory: &isDir) && !isDir.boolValue
+                    }
+                }
+                var allPresent = true
+                for await present in group where !present {
+                    allPresent = false
+                }
+                return allPresent
+            }
+        }
+
+        let ignoredDeltas = await service.simulateFSEvents([
+            createFSEvent(
+                path: "/tmp/test/vendor/lib.js",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated)
+            )
+        ])
+        let trackedDeltas = await service.simulateFSEvents([
+            createFSEvent(
+                path: "/tmp/test/src/app.swift",
+                flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated)
+            )
+        ])
+
+        let allPresent = await hammer.value
+        XCTAssertTrue(allPresent, "every concurrently written path must be visible in the shared double")
+        XCTAssertTrue(
+            ignoredDeltas.isEmpty,
+            "vendor/ must be ignored — proves the virtual .gitignore reached the IgnoreRulesManager actor"
+        )
+        XCTAssertFalse(
+            trackedDeltas.isEmpty,
+            "positive control: a non-ignored file under the same virtual root must still produce a delta"
+        )
+    }
 }

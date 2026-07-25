@@ -3,6 +3,7 @@ import WorkspaceIgnore
 import WorkspacePathsCore
 import Combine
 import Dispatch
+import Synchronization
 import CoreServices
 #if DEBUG || EDIT_FLOW_PERF
 import os
@@ -354,8 +355,20 @@ public actor FileSystemService {
 	)
 	
 	#if DEBUG
+	/// Backing storage for `enableDebugLogging`.
+	///
+	/// The flag is a standalone boolean: nothing else is published through it
+	/// and no invariant ties it to other state, so `.relaxed` ordering is
+	/// sufficient — a reader only needs to observe some consistent value. An
+	/// `Atomic` (rather than `nonisolated(unsafe)`) keeps the global genuinely
+	/// concurrency-safe while preserving the public `var` shape.
+	private static let debugLoggingEnabled = Atomic<Bool>(false)
+
 	/// Static flag to enable verbose debug logging (default: false)
-	public static var enableDebugLogging = false
+	public static var enableDebugLogging: Bool {
+		get { debugLoggingEnabled.load(ordering: .relaxed) }
+		set { debugLoggingEnabled.store(newValue, ordering: .relaxed) }
+	}
 	#endif
 
 	private func fileSystemDebugLog(_ message: @autoclosure () -> String) {
@@ -373,6 +386,13 @@ public actor FileSystemService {
 	private var fm: any TestFS {
 		return fileManagerOverride ?? fileManager
 	}
+
+	/// `fm`, boxed so it can be read from another isolation domain (the
+	/// off-actor scan helpers). `TestFS` cannot refine `Sendable` — see
+	/// `TestFSTransfer` for the invariant that makes this legal.
+	private var fmTransfer: TestFSTransfer {
+		TestFSTransfer(fm)
+	}
 	#else
 	/// In release builds, always use FileManager.default
 	private var fm: FileManager { fileManager }
@@ -388,7 +408,14 @@ public actor FileSystemService {
 	private var fseventStreamRef: FSEventStreamRef?
 	
 	/// Publishes arrays of deltas whenever changes occur
-	private var changePublisher = PassthroughSubject<[FileSystemDelta], Never>()
+	private let changePublisher = PassthroughSubject<[FileSystemDelta], Never>()
+
+	/// Live `changesStream()` subscriptions, keyed by stream identity. Combine's
+	/// `AnyCancellable` is not `Sendable`, so the cancellable is created and
+	/// retained entirely inside this actor and is only ever released here (via
+	/// `endChangesStream(_:)`, hopped back from the stream's termination
+	/// handler). Nothing non-`Sendable` crosses the actor boundary.
+	private var changeStreamSubscriptions: [UUID: AnyCancellable] = [:]
 	#if DEBUG
 	private var lastPublishedDeltaCoalescingDiagnostics: PublishedDeltaCoalescingDiagnostics?
 	private var lastEventTargetIgnoreFastPathDiagnostics: EventTargetIgnoreFastPathDiagnostics?
@@ -673,7 +700,14 @@ public actor FileSystemService {
 		#if DEBUG
 		// Keep the singleton test override scoped to this service. Passing nil is
 		// intentional: earlier InMemoryFS tests must not leak into later real-FS tests.
-		await IgnoreRulesManager.shared.setFileManagerOverride(fileManagerOverride)
+		//
+		// The double is deliberately observed by BOTH this actor and the
+		// IgnoreRulesManager actor, so it has to cross an isolation boundary.
+		// `TestFSTransfer` carries the documented invariant that makes that
+		// legal (see its doc comment); `TestFS` itself cannot refine `Sendable`
+		// because `FileManager` conforms to it.
+		let overrideTransfer = TestFSTransfer(fileManagerOverride)
+		await IgnoreRulesManager.shared.setFileManagerOverride(overrideTransfer.fileSystem)
 		#endif
 
 		// Use test ignore rules or load fresh ones
@@ -852,7 +886,48 @@ public actor FileSystemService {
 	public func publisherForChanges() -> AnyPublisher<[FileSystemDelta], Never> {
 		changePublisher.eraseToAnyPublisher()
 	}
-	
+
+	/// `Sendable` counterpart to `publisherForChanges()` for consumers that live
+	/// in another isolation domain.
+	///
+	/// Combine's `AnyPublisher`/`AnyCancellable` are not `Sendable`, so handing
+	/// the publisher itself to (say) a `@MainActor` adapter is a concurrency
+	/// error. Instead the subscription is created *and retained* on this actor
+	/// and each batch is forwarded through an `AsyncStream<[FileSystemDelta]>`
+	/// — `FileSystemDelta` is `Sendable`, and both `AsyncStream` and its
+	/// continuation are `Sendable`, so only value types cross the boundary.
+	///
+	/// Delivery preserves publisher order (the continuation is unbounded and
+	/// `yield` is ordered). The subscription is torn down when the consumer
+	/// stops iterating (task cancellation or iterator release), which fires
+	/// `onTermination`.
+	func changesStream() -> AsyncStream<[FileSystemDelta]> {
+		let token = UUID()
+		let (stream, continuation) = AsyncStream<[FileSystemDelta]>.makeStream()
+		changeStreamSubscriptions[token] = changePublisher.sink { deltas in
+			continuation.yield(deltas)
+		}
+		continuation.onTermination = { [weak self] _ in
+			guard let self else { return }
+			Task { await self.endChangesStream(token) }
+		}
+		return stream
+	}
+
+	/// Releases the Combine subscription backing a `changesStream()` consumer.
+	private func endChangesStream(_ token: UUID) {
+		changeStreamSubscriptions.removeValue(forKey: token)
+	}
+
+	#if DEBUG
+	/// Test-only: number of live `changesStream()` subscriptions still retained
+	/// by this actor. Internal (not public API) — used to pin the teardown half
+	/// of the stream's ownership contract.
+	var liveChangesStreamCount: Int {
+		changeStreamSubscriptions.count
+	}
+	#endif
+
 	/// Request to stop watching for changes. This tears down the FSEvent stream.
 	public func stopWatchingForChanges() {
 		stopFSEventStream()
@@ -1046,7 +1121,13 @@ public actor FileSystemService {
 			diagnosticsAccumulator?.recordResult(eligibility)
 		}
 
-		func fallbackEligibility(
+		// `nonisolated(nonsending)`: a bare nested `async` function is inferred
+		// `@concurrent` under Swift 6, which would hop this helper onto the
+		// global executor and force the actor-confined `diagnosticsAccumulator`
+		// across an isolation boundary. It has always been meant to run on the
+		// caller's executor (this actor) — it only awaits another isolated
+		// method and mutates actor-confined bookkeeping.
+		nonisolated(nonsending) func fallbackEligibility(
 			relativePath: String,
 			reason: CatalogEligibilityFallbackReason
 		) async -> CatalogRegularFileEligibility {
@@ -4333,7 +4414,38 @@ public actor FileSystemService {
 			let respectRepoIgnore = self.respectRepoIgnore
 			let respectCursorignore = self.respectCursorignore
 
-			try await withThrowingTaskGroup(of: DirectoryChunkResult.self) { group in
+			// The task-group body is a `sending` closure, so it must not capture
+			// the batch accumulators (`chunkFolders`/`chunkFiles`/
+			// `pendingFileCount`/`totalFilesSeen`), the `directories` worklist,
+			// or the non-Sendable `yield` closure — those are all used again
+			// after the group returns. Collect the child results inside the
+			// group (capturing only `self` and Sendable values) and apply them
+			// on the actor afterwards.
+			//
+			// Completion order is preserved: `for try await result in group`
+			// still yields in completion order and `batchResults` is appended
+			// in that same order, so on the SUCCESS path the sequence of
+			// visited-path updates, ignore-cache merges, worklist growth and
+			// `flush()` calls is exactly what it was. Two differences are real
+			// and deliberate:
+			//
+			//  1. The group fully drains before any result is applied, which
+			//     removes the window where actor re-entrancy could observe a
+			//     half-applied chunk — but it also defers every `flush()` in a
+			//     batch to the end of that batch rather than emitting them as
+			//     children complete.
+			//  2. On the THROWING path the batch is now all-or-nothing.
+			//     Previously a child that threw left the already-applied
+			//     results of its completed siblings in place (and their chunks
+			//     already yielded); now the throw propagates out of
+			//     `withThrowingTaskGroup` before `batchResults` is consumed, so
+			//     those sibling results are discarded. The error still
+			//     propagates to the same caller either way, and a partially
+			//     applied batch was never a state any caller relied on — but it
+			//     is a behavior change, not an equivalence.
+			let batchResults: [DirectoryChunkResult] = try await withThrowingTaskGroup(
+				of: DirectoryChunkResult.self
+			) { group in
 				for context in batch {
 					#if DEBUG
 					group.addTask { [self,
@@ -4378,31 +4490,38 @@ public actor FileSystemService {
 					#endif
 				}
 
+				var collected: [DirectoryChunkResult] = []
+				collected.reserveCapacity(batch.count)
 				for try await result in group {
-					if !result.folders.isEmpty || !result.files.isEmpty {
-						chunkFolders.append(contentsOf: result.folders)
-						chunkFiles.append(contentsOf: result.files)
-						pendingFileCount += result.files.count
+					collected.append(result)
+				}
+				return collected
+			}
 
-						for folder in result.folders {
-							visitedPaths.insert(folder.relativePath)
-							visitedItems[folder.relativePath] = true
-						}
-						for file in result.files {
-							visitedPaths.insert(file.relativePath)
-							visitedItems[file.relativePath] = false
-						}
+			for result in batchResults {
+				if !result.folders.isEmpty || !result.files.isEmpty {
+					chunkFolders.append(contentsOf: result.folders)
+					chunkFiles.append(contentsOf: result.files)
+					pendingFileCount += result.files.count
 
-						flush()
+					for folder in result.folders {
+						visitedPaths.insert(folder.relativePath)
+						visitedItems[folder.relativePath] = true
+					}
+					for file in result.files {
+						visitedPaths.insert(file.relativePath)
+						visitedItems[file.relativePath] = false
 					}
 
-					if !result.subdirs.isEmpty {
-						directories.append(contentsOf: result.subdirs)
-					}
+					flush()
+				}
 
-					if !result.ignoreCacheDelta.isEmpty {
-						mergeIgnoreCache(result.ignoreCacheDelta)
-					}
+				if !result.subdirs.isEmpty {
+					directories.append(contentsOf: result.subdirs)
+				}
+
+				if !result.ignoreCacheDelta.isEmpty {
+					mergeIgnoreCache(result.ignoreCacheDelta)
 				}
 			}
 		}
@@ -4476,8 +4595,7 @@ public actor FileSystemService {
 		let scanResult: DirectoryScanResult
 		do {
 			let testMode = await service.isTestMode
-			if testMode {
-				let fm = await service.fm
+			if testMode, let fm = await service.fmTransfer.fileSystem {
 				scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath, fm: fm)
 			} else {
 				scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)

@@ -2,6 +2,7 @@ import Foundation
 import WorkspaceKitCSupport
 #if DEBUG
 import Darwin
+import Synchronization
 #endif
 
 // Wildmatch bit-flags (duplicated from wildmatch.h)
@@ -72,8 +73,12 @@ public struct IgnoreDebugMetrics: Sendable, Equatable, Codable {
 }
 
 public enum IgnoreDebugMetricsRecorder {
-	private static let lock = NSLock()
-	private static var storage = IgnoreDebugMetrics()
+	/// All counter state lives inside this `Mutex`. `IgnoreDebugMetrics` is a
+	/// `Sendable` value type, so `Mutex<IgnoreDebugMetrics>` is `Sendable` and
+	/// this is a plain immutable global — no `nonisolated(unsafe)` escape.
+	/// Every read/mutate goes through `withLock`, exactly as the previous
+	/// `NSLock` + `var storage` pair did.
+	private static let storage = Mutex(IgnoreDebugMetrics())
 	private static let enabledEnvironmentKey = "REPOPROMPT_IGNORE_METRICS_ENABLED"
 	private static let replayBenchmarkVerboseEnvironmentKey = "REPOPROMPT_REPLAY_BENCHMARK_VERBOSE_TELEMETRY"
 	private static let enabledDefaultsKey = "RepoPromptIgnoreMetricsEnabled"
@@ -93,15 +98,11 @@ public enum IgnoreDebugMetricsRecorder {
 	}()
 
 	public static func reset() {
-		lock.lock()
-		storage = IgnoreDebugMetrics()
-		lock.unlock()
+		storage.withLock { $0 = IgnoreDebugMetrics() }
 	}
 
 	public static func snapshot() -> IgnoreDebugMetrics {
-		lock.lock()
-		defer { lock.unlock() }
-		return storage
+		storage.withLock { $0 }
 	}
 
 	public static func recordCompile(
@@ -317,9 +318,7 @@ public enum IgnoreDebugMetricsRecorder {
 
 	private static func mutate(_ body: (inout IgnoreDebugMetrics) -> Void) {
 		guard isRecordingEnabled else { return }
-		lock.lock()
-		body(&storage)
-		lock.unlock()
+		storage.withLock { body(&$0) }
 	}
 }
 #endif

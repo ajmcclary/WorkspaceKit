@@ -607,4 +607,75 @@ final class IgnoreRulesTests: XCTestCase {
         XCTAssertTrue(rules.isIgnored(relativePath: "important.txt", isDirectory: false))
         XCTAssertTrue(rules.isIgnored(relativePath: "other.txt", isDirectory: false))
     }
+
+    // MARK: - Sendable / lock boundary
+
+    /// `IgnoreRules` is now `Sendable`: its chain tail and memoized snapshot
+    /// live inside a `Mutex`, and the node chain itself is immutable. That is
+    /// the real contract — `IgnoreRulesManager` (an actor) builds an instance
+    /// and hands it to `FileSystemService` (a different actor), which then
+    /// caches, clones and matches against it from its parallel scan paths.
+    ///
+    /// This pins that a single instance can be read from many tasks at once
+    /// and that every reader agrees, including readers that go through the
+    /// memoized `snapshot()` (the one read-modify-write under the lock).
+    func testIgnoreRulesAreSafeToShareAcrossConcurrentReaders() async {
+        let rules = IgnoreRules()
+        rules.addIgnoreFile(content: "*.log\nbuild/\n!keep.log", priority: 1)
+
+        let readers = 128
+        let results = await withTaskGroup(of: [Bool].self) { group in
+            for _ in 0..<readers {
+                group.addTask {
+                    let snapshot = rules.snapshot()
+                    return [
+                        rules.isIgnored(relativePath: "a.log", isDirectory: false),
+                        rules.isIgnored(relativePath: "keep.log", isDirectory: false),
+                        rules.isIgnored(relativePath: "build", isDirectory: true),
+                        rules.isIgnored(relativePath: "src/main.swift", isDirectory: false),
+                        rules.hasAnyNegativePatterns(),
+                        snapshot.isIgnored(relativePath: "a.log", isDirectory: false),
+                        snapshot.isIgnored(relativePath: "keep.log", isDirectory: false),
+                        snapshot.hasAnyNegativePatterns(),
+                        rules.clone().isIgnored(relativePath: "a.log", isDirectory: false)
+                    ]
+                }
+            }
+            var collected: [[Bool]] = []
+            for await row in group {
+                collected.append(row)
+            }
+            return collected
+        }
+
+        let expected = [true, false, true, false, true, true, false, true, true]
+        XCTAssertEqual(results.count, readers)
+        for row in results {
+            XCTAssertEqual(row, expected, "every concurrent reader must observe the same rule chain")
+        }
+    }
+
+    /// The memoized snapshot is invalidated by both mutation entry points.
+    /// Both now do a read-modify-write inside the `Mutex`, so this pins that
+    /// the invalidation still happens (a stale snapshot would silently ignore
+    /// later layers).
+    func testAddingLayersInvalidatesTheMemoizedSnapshot() {
+        let rules = IgnoreRules()
+        let before = rules.snapshot()
+        XCTAssertFalse(before.isIgnored(relativePath: "a.log", isDirectory: false))
+
+        rules.addIgnoreFile(content: "*.log", priority: 1)
+        let afterIgnoreFile = rules.snapshot()
+        XCTAssertTrue(afterIgnoreFile.isIgnored(relativePath: "a.log", isDirectory: false))
+        XCTAssertFalse(
+            before.isIgnored(relativePath: "a.log", isDirectory: false),
+            "an already-handed-out snapshot stays immutable"
+        )
+
+        rules.addCompiledLayer(GitignoreCompiler.compile(content: "*.tmp"))
+        let afterCompiledLayer = rules.snapshot()
+        XCTAssertTrue(afterCompiledLayer.isIgnored(relativePath: "b.tmp", isDirectory: false))
+        XCTAssertTrue(afterCompiledLayer.isIgnored(relativePath: "a.log", isDirectory: false))
+        XCTAssertFalse(afterIgnoreFile.isIgnored(relativePath: "b.tmp", isDirectory: false))
+    }
 }

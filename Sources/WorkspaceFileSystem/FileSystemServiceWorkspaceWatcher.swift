@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 import WorkspaceKit
 
 /// FSEvents-grade `WorkspaceFileWatching` adapter backed by the promoted
@@ -13,7 +12,12 @@ import WorkspaceKit
 @MainActor
 public final class FileSystemServiceWorkspaceWatcher: WorkspaceFileWatching {
 	private var service: FileSystemService?
-	private var subscription: AnyCancellable?
+	/// Pumps `FileSystemService.changesStream()` — a `Sendable` AsyncStream —
+	/// into this `@MainActor` adapter's own event stream. Combine's
+	/// `AnyCancellable` cannot cross the actor boundary under Swift 6, so the
+	/// engine-side subscription is owned by the engine actor and this side owns
+	/// only a `Task`.
+	private var forwardingTask: Task<Void, Never>?
 	private var eventContinuation: AsyncStream<WorkspaceFileEvent>.Continuation?
 	private var eventStream: AsyncStream<WorkspaceFileEvent>?
 	private var rootURL: URL?
@@ -21,6 +25,22 @@ public final class FileSystemServiceWorkspaceWatcher: WorkspaceFileWatching {
 
 	public init(respectGitignore: Bool = true) {
 		self.respectGitignore = respectGitignore
+	}
+
+	/// Restores the teardown-on-dealloc the replaced `AnyCancellable` provided.
+	///
+	/// Releasing a `Task` handle does NOT cancel the task, so a watcher dropped
+	/// without an explicit `stopWatching()` would otherwise leave the forwarder
+	/// suspended in `for await batch in deltas` forever — and with it the
+	/// engine-side `changesStream()` subscription, whose `onTermination` only
+	/// fires once the stream is torn down. The `[weak self]` guard inside the
+	/// loop does not help: it is only reached when a batch actually arrives,
+	/// which for an abandoned watcher may be never.
+	///
+	/// `isolated deinit` is required because the stored property is
+	/// `@MainActor`-isolated; it is available at this package's macOS 27 floor.
+	isolated deinit {
+		forwardingTask?.cancel()
 	}
 
 	public func startWatching(root: URL) async throws {
@@ -38,19 +58,25 @@ public final class FileSystemServiceWorkspaceWatcher: WorkspaceFileWatching {
 		eventContinuation = continuation
 
 		let base = root.standardizedFileURL
+		let deltas = await service.changesStream()
 		await service.startWatchingForChanges()
-		subscription = await service.publisherForChanges()
-			.sink { [weak self] deltas in
-				guard let self, let continuation = self.eventContinuation else { return }
-				for delta in deltas {
+		forwardingTask = Task { @MainActor [weak self] in
+			for await batch in deltas {
+				guard let self else { return }
+				// Same per-batch semantics as the old Combine sink: a batch
+				// arriving while no continuation is installed is dropped, it
+				// does not tear the forwarder down.
+				guard let continuation = self.eventContinuation else { continue }
+				for delta in batch {
 					continuation.yield(Self.event(for: delta, base: base))
 				}
 			}
+		}
 	}
 
 	public func stopWatching() {
-		subscription?.cancel()
-		subscription = nil
+		forwardingTask?.cancel()
+		forwardingTask = nil
 		if let service {
 			let retained = service
 			Task { await retained.stopWatchingForChanges() }

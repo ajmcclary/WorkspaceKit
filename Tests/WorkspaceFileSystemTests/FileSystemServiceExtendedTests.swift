@@ -634,8 +634,19 @@ final class FileSystemServiceExtendedTests: XCTestCase {
     func testFileSystemErrorHandling() async throws {
         // Create a SpyFS that can simulate errors
         class ErrorSimulatingFS: SpyFS {
-            var shouldThrowOnDirectory: String?
-            
+            // Lock-guarded to honour the `@unchecked Sendable` invariant this
+            // subclass silently inherits from SpyFS: the test body writes this
+            // from the main thread while the off-actor scan tasks read it
+            // inside `contentsOfDirectory`, so a plain `var` would be a real
+            // data race (and would falsify the invariant documented on the
+            // doubles in FSTestDoubles.swift).
+            private let errorLock = NSLock()
+            private var _shouldThrowOnDirectory: String?
+            var shouldThrowOnDirectory: String? {
+                get { errorLock.withLock { _shouldThrowOnDirectory } }
+                set { errorLock.withLock { _shouldThrowOnDirectory = newValue } }
+            }
+
             override func contentsOfDirectory(
                 at url: URL,
                 includingPropertiesForKeys keys: [URLResourceKey]?,

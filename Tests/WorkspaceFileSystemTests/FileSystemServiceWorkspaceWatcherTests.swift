@@ -143,6 +143,90 @@ final class FileSystemServiceWorkspaceWatcherTests: XCTestCase {
 		XCTAssertTrue(sawChildDelete, "expected a .deleted event for child.txt (subtree sweep must reach watcher consumers)")
 	}
 
+	// MARK: - changesStream() ownership boundary
+
+	/// `FileSystemServiceWorkspaceWatcher` no longer pulls a Combine
+	/// `AnyPublisher`/`AnyCancellable` out of the engine actor (neither is
+	/// `Sendable`); it consumes `FileSystemService.changesStream()` instead.
+	/// This pins the two halves of that boundary's contract:
+	///
+	/// - every published batch reaches the consumer, in publish order, and
+	/// - when the consumer stops iterating, the engine-side Combine
+	///   subscription is released rather than leaked.
+	func testChangesStreamDeliversBatchesInOrderAndReleasesSubscription() async throws {
+		let root = "/tmp/changes-stream-\(UUID().uuidString)"
+		let fs = InMemoryFS()
+		fs.addFolder(root)
+		fs.addFolder("\(root)/src")
+
+		let service = try await FileSystemService(
+			path: root,
+			respectGitignore: true,
+			skipSymlinks: true,
+			testVisitedPaths: [],
+			testVisitedItems: [:],
+			testIgnoreRules: nil,
+			isTestMode: true,
+			fileManagerOverride: fs
+		)
+
+		// Scoped so the consuming task is the ONLY owner of the stream, exactly
+		// like `FileSystemServiceWorkspaceWatcher.forwardingTask`. Releasing
+		// the last iterator is what tears the subscription down.
+		let collector: Task<[[FileSystemDelta]], Never>
+		do {
+			let stream = await service.changesStream()
+			let liveWhileSubscribed = await service.liveChangesStreamCount
+			XCTAssertEqual(liveWhileSubscribed, 1, "changesStream() must retain its subscription on the engine actor")
+
+			collector = Task {
+				var batches: [[FileSystemDelta]] = []
+				for await batch in stream {
+					batches.append(batch)
+					if batches.count == 2 { break }
+				}
+				return batches
+			}
+		}
+
+		fs.addFile("\(root)/src/a.swift")
+		_ = await service.simulateFSEvents([
+			(
+				absolutePath: "\(root)/src/a.swift",
+				flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated),
+				eventId: FSEventStreamEventId(1)
+			)
+		])
+		fs.addFile("\(root)/src/b.swift")
+		_ = await service.simulateFSEvents([
+			(
+				absolutePath: "\(root)/src/b.swift",
+				flags: FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated),
+				eventId: FSEventStreamEventId(2)
+			)
+		])
+
+		let batches = await collector.value
+		XCTAssertEqual(batches.count, 2, "both published batches must reach the stream consumer")
+		XCTAssertTrue(
+			batches[0].contains(.fileAdded("src/a.swift")),
+			"first batch must be the first publish, not a reordered one: \(batches)"
+		)
+		XCTAssertTrue(
+			batches[1].contains(.fileAdded("src/b.swift")),
+			"second batch must be the second publish: \(batches)"
+		)
+
+		// Termination hops back onto the actor, so poll (bounded) rather than
+		// assuming the release is synchronous with the consumer exiting.
+		var live = await service.liveChangesStreamCount
+		for _ in 0..<200 where live != 0 {
+			try await Task.sleep(nanoseconds: 5_000_000)
+			live = await service.liveChangesStreamCount
+		}
+		XCTAssertEqual(live, 0, "the engine-side subscription must be released once the consumer stops iterating")
+	}
+
 	func testStopFinishesStream() async throws {
 		let watcher = FileSystemServiceWorkspaceWatcher()
 		try await watcher.startWatching(root: tempDir)

@@ -1,18 +1,21 @@
 import Foundation
+import Synchronization
 
 /// A global pool that stores **unique** copies of pattern strings so every
 /// identical pattern across thousands of ignore files is backed by a single
 /// `String` instance. This can save tens of megabytes of RAM on large
 /// repositories while remaining bounded across long-lived app sessions.
 ///
-/// Thread-safety: `intern(_:)` uses an `NSLock`, which is perfectly adequate
-/// here because pattern compilation happens far less frequently than pattern
-/// matching.
-public final class PatternPool {
+/// Thread-safety: the interned set lives inside a `Mutex`, which is perfectly
+/// adequate here because pattern compilation happens far less frequently than
+/// pattern matching. Both stored properties are `let` and `Sendable`
+/// (`Mutex<Set<String>>` is `Sendable`; `Int` is), so this type is genuinely
+/// `Sendable` — no `@unchecked` escape is required and `shared` is a safe
+/// global.
+public final class PatternPool: Sendable {
     public static let shared = PatternPool()
 
-    private var set = Set<String>()
-    private let lock = NSLock()
+    private let internedPatterns = Mutex(Set<String>())
     private let maxEntries: Int
 
     private init(maxEntries: Int = 16_384) {
@@ -26,26 +29,23 @@ public final class PatternPool {
     /// inserting the next new string. Clearing only reduces future deduplication;
     /// compiled rules already hold independent `String` values.
     public func intern(_ pattern: String) -> String {
-        lock.lock()
-        defer { lock.unlock() }
+        internedPatterns.withLock { set in
+            if let existingIndex = set.firstIndex(of: pattern) {
+                return set[existingIndex]
+            }
 
-        if let existingIndex = set.firstIndex(of: pattern) {
-            return set[existingIndex]
+            if set.count >= maxEntries {
+                set.removeAll(keepingCapacity: false)
+            }
+
+            let inserted = set.insert(pattern)
+            return inserted.memberAfterInsert
         }
-
-        if set.count >= maxEntries {
-            set.removeAll(keepingCapacity: false)
-        }
-
-        let inserted = set.insert(pattern)
-        return inserted.memberAfterInsert
     }
 
     #if DEBUG
     public var countForTesting: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return set.count
+        internedPatterns.withLock { $0.count }
     }
 
     public var capacityForTesting: Int {
@@ -53,9 +53,7 @@ public final class PatternPool {
     }
 
     public func resetForTesting() {
-        lock.lock()
-        defer { lock.unlock() }
-        set.removeAll(keepingCapacity: false)
+        internedPatterns.withLock { $0.removeAll(keepingCapacity: false) }
     }
     #endif
 }

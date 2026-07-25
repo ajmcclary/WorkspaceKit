@@ -5,7 +5,22 @@ import Foundation
 // SpyFS doubles for the TestFS seam) — test targets can't share helpers
 // across the package boundary; the app copy stays for RepoFileManagerTests.
 
-class InMemoryFS: TestFS {
+/// `@unchecked Sendable`, with the invariant that **every** mutable property in
+/// this class hierarchy is read and written only under a lock:
+///
+/// - `InMemoryFS.tree` / `trashedOriginalPaths` — `NSRecursiveLock` (`withLock`).
+/// - `SpyFS.enumeratedDirs` / `checkedPaths` / `statPaths` — `NSLock`
+///   (`withSpyLock`).
+/// - `ConcurrencyTrackingFS._currentConcurrency` / `_maxObservedConcurrency` /
+///   `_totalEnumerations` / `_enumerationDelay` — `NSLock`.
+///
+/// Any subclass added here (or in an individual test file) must keep that
+/// invariant; a plain `var` on a subclass would silently inherit this
+/// conformance. The doubles exist precisely so one virtual file system can be
+/// observed by the `FileSystemService` actor, the `IgnoreRulesManager` actor
+/// and the off-actor scan helpers at the same time, so `Sendable` is the real
+/// contract, not a convenience.
+class InMemoryFS: TestFS, @unchecked Sendable {
     struct Node {
         var isDir: Bool
         var children: Set<String> = []
@@ -282,7 +297,7 @@ class InMemoryFS: TestFS {
     }
 }
 
-class SpyFS: InMemoryFS {
+class SpyFS: InMemoryFS, @unchecked Sendable {
     private let spyLock = NSLock()
     private var enumeratedDirs = Set<String>()
     private var checkedPaths = Set<String>()
@@ -339,15 +354,30 @@ class SpyFS: InMemoryFS {
 }
 
 /// A filesystem that tracks concurrent directory enumeration calls for parallelism testing
-class ConcurrencyTrackingFS: InMemoryFS {
+class ConcurrencyTrackingFS: InMemoryFS, @unchecked Sendable {
     private let lock = NSLock()
     private var _currentConcurrency = 0
     private var _maxObservedConcurrency = 0
     private var _totalEnumerations = 0
     
-    /// Artificial delay to make concurrent calls overlap
-    var enumerationDelay: TimeInterval = 0.01
-    
+    private var _enumerationDelay: TimeInterval = 0.01
+
+    /// Artificial delay to make concurrent calls overlap. Lock-guarded like the
+    /// counters below: it is set from the test body while `contentsOfDirectory`
+    /// reads it from the scan tasks.
+    var enumerationDelay: TimeInterval {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _enumerationDelay
+        }
+        set {
+            lock.lock()
+            _enumerationDelay = newValue
+            lock.unlock()
+        }
+    }
+
     /// Current number of concurrent contentsOfDirectory calls
     var currentConcurrency: Int {
         lock.lock()
@@ -380,10 +410,11 @@ class ConcurrencyTrackingFS: InMemoryFS {
             _maxObservedConcurrency = _currentConcurrency
         }
         lock.unlock()
-        
+
         // Add artificial delay to increase chance of overlap
-        if enumerationDelay > 0 {
-            Thread.sleep(forTimeInterval: enumerationDelay)
+        let delay = enumerationDelay
+        if delay > 0 {
+            Thread.sleep(forTimeInterval: delay)
         }
         
         // Get the actual result

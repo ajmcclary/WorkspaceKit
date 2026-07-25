@@ -2,7 +2,28 @@ import Foundation
 
 /// Evaluates paths against a hierarchy of ignore rules, checking each prefix
 /// to ensure parent directories that are ignored also ignore their children.
-public final class HierarchicalIgnoreEvaluator {
+///
+/// `@unchecked Sendable`, with the following invariant:
+///
+/// - The evaluator contributes **no mutable state of its own**. It has exactly
+///   one stored property, `let rulesProvider`, and both `isIgnored` overloads
+///   operate entirely on locals (`pathSoFar`, `lastOutcome`, `lockedRules`).
+///   There is nothing here for two callers to race on.
+/// - Its concurrency safety therefore reduces *entirely* to the injected
+///   `RulesProvider`, and calling `rulesForDirectory` concurrently is part of
+///   that protocol's contract. All in-tree providers honour it:
+///   `CachedRulesProvider` reads only immutable `let` state,
+///   `FileSystemService.FileSystemRulesProvider` forwards to a
+///   `FileSystemService` actor, and the test `MockRulesProvider` is an actor.
+///
+/// The conformance is `@unchecked` rather than checked because
+/// `HierarchicalIgnoreEvaluator.RulesProvider` is public API with existing
+/// conformers; refining it with `Sendable` would be a source break for them.
+///
+/// Cross-concurrency coverage: `HierarchicalIgnoreEvaluatorTests
+/// .testConcurrentAccess` drives 100 concurrent `isIgnored` calls through a
+/// single shared evaluator instance.
+public final class HierarchicalIgnoreEvaluator: @unchecked Sendable {
     
     /// A provider of ignore rules for a given directory path
     public protocol RulesProvider {

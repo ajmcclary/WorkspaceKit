@@ -8,7 +8,7 @@ typealias size_t = Int
 public actor PathSearchIndex {
     // MARK: - Types
     
-    public struct Candidate {
+    public struct Candidate: Sendable {
         public let index: Int
         public let path: String
         public let filename: String
@@ -36,7 +36,14 @@ public actor PathSearchIndex {
         self.cIndex = nil
     }
     
-    deinit {
+    /// `isolated` because `cIndex` is actor-isolated state of a non-`Sendable`
+    /// type (`OpaquePointer?`): a `nonisolated deinit` may not touch it. The
+    /// C index is owned exclusively by this actor — `rebuild(paths:)` is the
+    /// only other site that destroys it, and it runs on the same executor —
+    /// so serializing the final `path_search_destroy` on that executor keeps
+    /// the destroy/create pairing exactly-once. The trade-off is that the
+    /// free may be enqueued rather than run inline at last-release.
+    isolated deinit {
         if let index = cIndex {
             path_search_destroy(index)
         }

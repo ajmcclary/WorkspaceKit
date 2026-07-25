@@ -18,8 +18,16 @@ Also ships:
 - `WorkspaceKitCSupport` — bundled wildmatch matcher + gitignore-compatible
   `repo_*` wrappers backing the ignore stack.
 
-Zero external dependencies. Contracts target is Swift 6 strict concurrency.
-Floors: macOS 14 / iOS 17.
+Zero external dependencies. Every Swift target (and every test target) builds
+in Swift 6 language mode with `StrictConcurrency` enabled.
+
+Floor: **macOS 27 — macOS only.** The `WorkspaceFileSystem` target's
+`FileSystemService` uses the FSEvents C API unconditionally, and FSEvents does
+not exist on iOS, so the library product cannot cross-compile for iOS
+(`xcodebuild -destination 'generic/platform=iOS'` fails with "cannot find type
+'FSEventStreamRef' in scope"). The previously declared `.iOS(.v17)` floor was
+never backed by a working build. Restoring an iOS floor requires
+platform-gating `WorkspaceFileSystem` first.
 
 Consumers: `CodeEditorKit` (its `CodeEditorWorkspace` product is an
 `@_exported` shim over this package) and, through that shim, the CodeEditor

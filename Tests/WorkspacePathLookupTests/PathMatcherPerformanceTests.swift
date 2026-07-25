@@ -121,7 +121,11 @@ final class PathMatcherPerformanceTests: XCTestCase {
         }
         
         measure {
-            Task {
+            // Capture `files` by value: `Task.init` takes a `sending` closure,
+            // so it may not capture the mutable local's box — every `measure`
+            // iteration re-reads it. The element type is Sendable, so the copy
+            // is a disconnected value and the closure stays transferable.
+            Task { [files] in
                 let snapshot = await PathMatcherTestHelper.makeSnapshot(files: files)
                 XCTAssertGreaterThan(snapshot.filesByFullPath.count, 0)
             }

@@ -1,11 +1,26 @@
 import Foundation
+import Synchronization
 
 /// Holds multiple "layers" of compiled patterns (from .gitignore, .repo_ignore, etc.), combined.
-
-public final class IgnoreRules {
+///
+/// `Sendable` because every piece of mutable state (the chain tail and the
+/// memoized snapshot) lives inside a single `Mutex`, and the chain itself is
+/// built from deeply immutable `RulesNode`s. Instances are routinely handed
+/// between isolation domains — `IgnoreRulesManager` (an actor) builds one and
+/// returns it to `FileSystemService` (another actor) — so this is the real
+/// ownership contract, not a convenience.
+///
+/// The lock is held only long enough to read or swap the tail reference; the
+/// pattern-matching walk itself runs outside the critical section, because the
+/// node chain reachable from a tail can never change.
+public final class IgnoreRules: Sendable {
 	
 	// MARK: - Internal persistent node
-	fileprivate final class RulesNode {
+	/// Every stored property is a `let` of a `Sendable` type, so nodes are
+	/// deeply immutable once constructed and may be shared across isolation
+	/// domains (the `baseNode` global and `clone()`'s shared chain both rely
+	/// on that).
+	fileprivate final class RulesNode: Sendable {
 		let compiled: CompiledIgnoreRules
 		let parent: RulesNode?
 		/// Number of layers from root to this node (root = 1)
@@ -45,20 +60,32 @@ public final class IgnoreRules {
 	}
 	
 	// MARK: - Storage
-	/// Tail of the linked chain (highest priority layer)
-	private var tail: RulesNode
-	private var cachedSnapshot: IgnoreRulesSnapshot?
-	
+
+	private struct State {
+		/// Tail of the linked chain (highest priority layer)
+		var tail: RulesNode
+		var cachedSnapshot: IgnoreRulesSnapshot?
+	}
+
+	private let state: Mutex<State>
+
+	/// Snapshot of the current chain tail. Read under the lock, then used
+	/// outside it — a `RulesNode` and everything it points at is immutable, so
+	/// the walk cannot observe a torn chain.
+	private var tail: RulesNode {
+		state.withLock { $0.tail }
+	}
+
 	// MARK: - Initialisers
-	
+
 	/// Creates a new instance that starts with the shared default ignore layer.
 	public init() {
-		self.tail = IgnoreRules.baseNode
+		self.state = Mutex(State(tail: IgnoreRules.baseNode, cachedSnapshot: nil))
 	}
-	
+
 	/// Private designated initialiser used by `clone()` to share the same chain.
 	private init(tail: RulesNode) {
-		self.tail = tail
+		self.state = Mutex(State(tail: tail, cachedSnapshot: nil))
 	}
 	
 	// MARK: - Public API
@@ -70,8 +97,10 @@ public final class IgnoreRules {
 	/// where `priority` is monotonically increasing.
 	public func addIgnoreFile(content: String, priority: Int, directoryPath: String = "") {
 		let compiled = GitignoreCompiler.compile(content: content, directoryPath: directoryPath)
-		cachedSnapshot = nil
-		tail = RulesNode(compiled: compiled, parent: tail)
+		state.withLock { state in
+			state.cachedSnapshot = nil
+			state.tail = RulesNode(compiled: compiled, parent: state.tail)
+		}
 	}
 	
 	/// Return `true` if, after consulting all layers from highest to lowest,
@@ -113,6 +142,7 @@ public final class IgnoreRules {
 	/// Precondition: the caller has already proven the parent directory is not ignored;
 	/// directory-only patterns are skipped on that basis because the leaf is a regular file.
 	public func makePositiveOnlyDirectFileLeafMatcher(parentComponents: [Substring]) -> PositiveOnlyDirectFileLeafMatcher? {
+		let tail = self.tail
 		guard !tail.hasNegative else { return nil }
 		let parentPath = parentComponents.joined(separator: "/")
 		var predicates: [PositiveOnlyDirectFileLeafPredicate] = []
@@ -140,6 +170,7 @@ public final class IgnoreRules {
 	/// Returns true if any negative rule requires us to keep scanning the
 	/// directory located at `path` (relative to the repository root).
 	public func requiresTraversal(for path: String) -> Bool {
+		let tail = self.tail
 		#if DEBUG
 		let recordIgnoreMetrics = IgnoreDebugMetricsRecorder.isRecordingEnabled
 		if recordIgnoreMetrics {
@@ -199,25 +230,28 @@ public final class IgnoreRules {
 
 	/// Immutable snapshot safe to send off-actor.
 	public func snapshot() -> IgnoreRulesSnapshot {
-		if let cached = cachedSnapshot {
-			return cached
+		state.withLock { state in
+			if let cached = state.cachedSnapshot {
+				return cached
+			}
+			let tail = state.tail
+			var layers: [CompiledIgnoreRules] = []
+			layers.reserveCapacity(tail.depth)
+			var node: RulesNode? = tail
+			while let current = node {
+				layers.append(current.compiled)
+				node = current.parent
+			}
+			let snapshot = IgnoreRulesSnapshot(
+				layers: layers,
+				hasNegative: tail.hasNegative,
+				traversalPrefixes: tail.traversalPrefixes,
+				traversalPatterns: tail.traversalPatterns,
+				traversalDiagnostics: tail.traversalDiagnostics
+			)
+			state.cachedSnapshot = snapshot
+			return snapshot
 		}
-		var layers: [CompiledIgnoreRules] = []
-		layers.reserveCapacity(tail.depth)
-		var node: RulesNode? = tail
-		while let current = node {
-			layers.append(current.compiled)
-			node = current.parent
-		}
-		let snapshot = IgnoreRulesSnapshot(
-			layers: layers,
-			hasNegative: tail.hasNegative,
-			traversalPrefixes: tail.traversalPrefixes,
-			traversalPatterns: tail.traversalPatterns,
-			traversalDiagnostics: tail.traversalDiagnostics
-		)
-		cachedSnapshot = snapshot
-		return snapshot
 	}
 	
 	// MARK: - Static shared default layer
@@ -326,8 +360,10 @@ public extension IgnoreRules {
 	/// Appends a **pre-compiled** layer as the new highest-priority node.
 	/// This avoids recompiling the same file multiple times when the caller
 	/// already has a `CompiledIgnoreRules` instance.
-	public func addCompiledLayer(_ compiled: CompiledIgnoreRules) {
-		cachedSnapshot = nil
-		tail = RulesNode(compiled: compiled, parent: tail)
+	func addCompiledLayer(_ compiled: CompiledIgnoreRules) {
+		state.withLock { state in
+			state.cachedSnapshot = nil
+			state.tail = RulesNode(compiled: compiled, parent: state.tail)
+		}
 	}
 }
