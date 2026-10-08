@@ -78,6 +78,45 @@ final class FileSystemServiceWorkspaceWatcherTests: XCTestCase {
 		XCTAssertTrue(sawModify, "expected a .modified event for seed.txt")
 	}
 
+	/// A file that existed before `startWatching` must report `.modified` on
+	/// its first change. Unlike `testCreateAndModifyAreObserved`, nothing else
+	/// changes, so no sibling-triggered rescan can register the file first —
+	/// the watcher's own initial scan has to.
+	func testFirstModificationOfPreexistingFileIsModified() async throws {
+		let existing = tempDir.appendingPathComponent("existing.txt")
+		try Data("v1".utf8).write(to: existing)
+
+		let watcher = FileSystemServiceWorkspaceWatcher()
+		try await watcher.startWatching(root: tempDir)
+		defer { watcher.stopWatching() }
+
+		actor Log {
+			var events: [WorkspaceFileEvent] = []
+			func add(_ e: WorkspaceFileEvent) { events.append(e) }
+		}
+		let log = Log()
+		let recorder = Task { [events = watcher.events] in
+			for await event in events { await log.add(event) }
+		}
+		defer { recorder.cancel() }
+
+		// Give FSEvents a beat to arm before mutating.
+		try await Task.sleep(nanoseconds: 1_000_000_000)
+		try Data("v2 longer".utf8).write(to: existing)
+
+		let deadline = Date().addingTimeInterval(20)
+		var sawModify = false
+		while Date() < deadline, !sawModify {
+			sawModify = await log.events.contains {
+				if case .modified(let url) = $0 { return url.lastPathComponent == "existing.txt" }
+				return false
+			}
+			if !sawModify { try? await Task.sleep(nanoseconds: 250_000_000) }
+		}
+		let events = await log.events
+		XCTAssertTrue(sawModify, "expected a .modified event for existing.txt; got \(events)")
+	}
+
 	func testDeletionsAreObserved() async throws {
 		let watcher = FileSystemServiceWorkspaceWatcher()
 		try await watcher.startWatching(root: tempDir)
