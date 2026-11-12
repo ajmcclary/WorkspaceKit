@@ -4825,7 +4825,10 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		if let bom = Self.detectBOMEncoding(in: initialData) {
 			encoding = bom
 		} else if let label = detector.finish() {
-			encoding = .init(ianaCharsetName: label)
+			// A label CoreFoundation cannot map falls back to UTF-8 when the
+			// bytes are UTF-8, and to Foundation's guess otherwise.
+			encoding = String.Encoding(ianaCharsetName: label)
+				?? (String(data: fullData, encoding: .utf8) != nil ? .utf8 : foundationEncodingGuess(fullData))
 		} else {
 			encoding = .utf8           // no secondary heuristics
 		}
@@ -4988,8 +4991,10 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	}
 
 	// 2) Injected library detector (fast – O(n) on the *same* bytes)
-	if let label = charsetDetector.detectedCharacterEncodingLabel(for: initialData) {
-		return .init(ianaCharsetName: label)
+	// (an unmappable label falls through to the heuristics below)
+	if let label = charsetDetector.detectedCharacterEncodingLabel(for: initialData),
+		let encoding = String.Encoding(ianaCharsetName: label) {
+		return encoding
 	}
 
 	// 3) UTF-8 strict
@@ -6633,24 +6638,26 @@ public struct DetectedText {
 }
 
 /// Convert an IANA charset label (e.g. "windows-1252") to `String.Encoding`.
-/// Falls back to UTF-8 on unknown labels.
+/// Returns nil for a label CoreFoundation does not know, so callers fall back
+/// to their heuristics instead of decoding with an invalid encoding. uchardet's
+/// "UHC" (and the "CP949" alias) map to code page 949, which CoreFoundation
+/// does not recognise by those names.
 private extension String.Encoding {
-	public init(ianaCharsetName name: String) {
-		let cfEnc = CFStringConvertIANACharSetNameToEncoding(name as CFString)
+	init?(ianaCharsetName name: String) {
+		let cfEnc: CFStringEncoding
+		switch name.uppercased() {
+		case "UHC", "CP949", "WINDOWS-949":
+			cfEnc = CFStringEncoding(CFStringEncodings.dosKorean.rawValue)
+		default:
+			cfEnc = CFStringConvertIANACharSetNameToEncoding(name as CFString)
+		}
+		guard cfEnc != kCFStringEncodingInvalidId else { return nil }
 		self.init(rawValue: CFStringConvertEncodingToNSStringEncoding(cfEnc))
 	}
 }
 
-// MARK: - Encoding detection helpers & priority tables
-/// Run a streaming detector (Cuchardet) over the entire byte sequence.
-/// Falls back to Foundation’s heuristic if the detector is unavailable.
-private func detectEncodingFull(_ data: Data, detector: any WorkspaceCharsetDetecting) -> String.Encoding {
-	// 1) Primary - injected library detector
-	if let label = detector.detectedCharacterEncodingLabel(for: data) {
-		return .init(ianaCharsetName: label)
-	}
-	
-	// 2) Fallback - Foundation heuristic
+/// Foundation's own guess for `data`, or UTF-8 when it has none.
+private func foundationEncodingGuess(_ data: Data) -> String.Encoding {
 	var lossy = ObjCBool(false)
 	let guess = NSString.stringEncoding(
 		for: data,
@@ -6659,6 +6666,20 @@ private func detectEncodingFull(_ data: Data, detector: any WorkspaceCharsetDete
 		usedLossyConversion: &lossy
 	)
 	return guess != 0 ? .init(rawValue: guess) : .utf8
+}
+
+// MARK: - Encoding detection helpers & priority tables
+/// Run a streaming detector (Cuchardet) over the entire byte sequence.
+/// Falls back to Foundation’s heuristic if the detector is unavailable.
+private func detectEncodingFull(_ data: Data, detector: any WorkspaceCharsetDetecting) -> String.Encoding {
+	// 1) Primary - injected library detector (an unmappable label falls through)
+	if let label = detector.detectedCharacterEncodingLabel(for: data),
+		let encoding = String.Encoding(ianaCharsetName: label) {
+		return encoding
+	}
+	
+	// 2) Fallback - Foundation heuristic
+	return foundationEncodingGuess(data)
 }
 
 

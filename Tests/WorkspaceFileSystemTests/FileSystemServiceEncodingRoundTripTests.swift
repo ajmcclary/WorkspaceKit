@@ -71,3 +71,81 @@ final class FileSystemServiceEncodingRoundTripTests: XCTestCase {
 		XCTAssertEqual(try bytes("latin.txt"), original, "written back in a different encoding")
 	}
 }
+
+/// A charset label the detector returns but CoreFoundation does not know
+/// must not become an invalid encoding.
+final class FileSystemServiceCharsetLabelTests: XCTestCase {
+
+	private struct FixedLabelDetector: WorkspaceCharsetDetecting {
+		let label: String
+		func detectedCharacterEncodingLabel(for data: Data) -> String? { label }
+		func makeStreamingDetector() -> any WorkspaceStreamingCharsetDetector { Streaming(label: label) }
+		final class Streaming: WorkspaceStreamingCharsetDetector {
+			let label: String
+			init(label: String) { self.label = label }
+			func analyzeNextChunk(_ data: Data) -> Bool { true }
+			func finish() -> String? { label }
+		}
+	}
+
+	private var rootURL: URL!
+
+	override func setUpWithError() throws {
+		rootURL = FileManager.default.temporaryDirectory
+			.appendingPathComponent("FSCharsetLabel-\(UUID().uuidString)", isDirectory: true)
+		try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+	}
+
+	override func tearDownWithError() throws {
+		try? FileManager.default.removeItem(at: rootURL)
+	}
+
+	private func makeService(label: String) async throws -> FileSystemService {
+		try await FileSystemService(
+			path: rootURL.path,
+			respectGitignore: false,
+			respectRepoIgnore: false,
+			respectCursorignore: false,
+			charsetDetector: FixedLabelDetector(label: label)
+		)
+	}
+
+	private static let cp949 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+		CFStringEncoding(CFStringEncodings.dosKorean.rawValue)
+	))
+
+	func testUHCLabelDecodesKoreanCodePage949() async throws {
+		let text = "안녕하세요, 세계\n"
+		let data = try XCTUnwrap(text.data(using: Self.cp949))
+		try data.write(to: rootURL.appendingPathComponent("korean.txt"))
+		let service = try await makeService(label: "UHC")
+
+		let legacy = try await service.loadContent(ofRelativePath: "korean.txt")
+		XCTAssertEqual(legacy, text)
+		let typed = try await service.readFileContent(atRelativePath: "korean.txt")
+		XCTAssertEqual(typed.text, text)
+	}
+
+	func testUHCLabelDecodesLargeKoreanFile() async throws {
+		let line = "안녕하세요, 세계 - 0123456789\n"
+		let text = String(repeating: line, count: 80_000) // > 2 MB in CP949, streamed path
+		let data = try XCTUnwrap(text.data(using: Self.cp949))
+		XCTAssertGreaterThan(data.count, 2_000_000)
+		try data.write(to: rootURL.appendingPathComponent("korean-large.txt"))
+		let service = try await makeService(label: "UHC")
+
+		let legacy = try await service.loadContent(ofRelativePath: "korean-large.txt")
+		XCTAssertEqual(legacy?.count, text.count)
+	}
+
+	func testUnknownLabelFallsBackInsteadOfFailing() async throws {
+		let original: [UInt8] = [0x63, 0x61, 0x66, 0xE9, 0x0A] // "café\n" in Latin-1
+		try Data(original).write(to: rootURL.appendingPathComponent("latin.txt"))
+		let service = try await makeService(label: "GEORGIAN-ACADEMY")
+
+		let legacy = try await service.loadContent(ofRelativePath: "latin.txt")
+		XCTAssertEqual(legacy, "café\n")
+		let encoding = try await service.detectEncodingForInitialChunk(initialData: Data(original))
+		XCTAssertNotNil(String(data: Data(original), encoding: encoding))
+	}
+}
