@@ -432,6 +432,11 @@ public actor FileSystemService {
 	
 	/// Caches the detected encoding for every file we have successfully opened
 	private var encodingMap = [String: String.Encoding]()
+
+	/// Normalised relative paths of files that were read with a leading
+	/// Unicode byte-order mark in `encodingMap`'s encoding; `editFile`
+	/// re-emits the mark. Keys follow `encodingMap`.
+	private var byteOrderMarkPaths = Set<String>()
 	
 	/// Path we are managing
 	public let path: String
@@ -4047,6 +4052,9 @@ public actor FileSystemService {
 			encodingMap.removeValue(forKey: stdOld)
 			encodingMap[stdNew] = encoding
 		}
+		if byteOrderMarkPaths.remove(stdOld) != nil {
+			byteOrderMarkPaths.insert(stdNew)
+		}
 		
 		// 6) Emit synthetic deltas so the UI updates before FSEvents arrive
 		changePublisher.send([.fileRemoved(stdOld), .fileAdded(stdNew)])
@@ -4657,6 +4665,15 @@ public actor FileSystemService {
 
 	/// Loads text-based content for `relativePath`, returning nil if file is recognized as binary or too large.
 /// This is a simple entry point that chooses either single-shot read for small files or chunk-based read for large ones.
+	///
+	/// - Important: Deprecated for any read whose result may be written back.
+	///   Non-text outcomes come back in-band (`nil` for binary; for files of
+	///   2 MB and more, the placeholder strings `"[File too large: N bytes]"`
+	///   and `"[Binary data or unknown encoding]"`), and editing and saving such
+	///   a string replaces the whole file. Use
+	///   `readFileContent(atRelativePath:sizeLimit:)`, which reports those
+	///   outcomes as `WorkspaceFileReadResult` cases. Kept source-compatible
+	///   until consumers have moved.
 public func loadContent(ofRelativePath relativePath: String) async throws -> String? {
 	// Early, no-IO short-circuit for known-binary extensions
 	let relExt = ((relativePath as NSString).pathExtension).lowercased()
@@ -4692,7 +4709,7 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 	// (3) Small files – read once, detect encoding
 	if fileSize < 2_000_000 {
 		let detected = try readDataAndDetectEncoding(fullPath)
-		encodingMap[encodingKey] = detected.encoding
+		recordEncoding(detected.encoding, hasByteOrderMark: detected.hasByteOrderMark, forKey: encodingKey)
 		return detected.string
 	}
 
@@ -4710,6 +4727,16 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		return try await loadContent(ofRelativePath: relativePath)
 	}
 	
+	/// `loadContent(ofRelativePath:)` plus the modification date.
+	///
+	/// - Important: Deprecated for any read whose result may be written back.
+	///   Non-text outcomes come back in-band (`nil` for binary; for files of
+	///   2 MB and more, the placeholder strings `"[File too large: N bytes]"`
+	///   and `"[Binary data or unknown encoding]"`), and editing and saving such
+	///   a string replaces the whole file. Use
+	///   `readFileContent(atRelativePath:sizeLimit:)`, which reports those
+	///   outcomes as `WorkspaceFileReadResult` cases. Kept source-compatible
+	///   until consumers have moved.
 	public func loadContentWithDate(ofRelativePath relativePath: String) async throws -> (content: String?, modificationDate: Date) {
 		//let _ = getFullPath(forRelativePath: relativePath)
 		async let content = loadContent(ofRelativePath: relativePath)
@@ -4723,6 +4750,15 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 	///   1. BOM (cheap, deterministic)
 	///   2. Cuchardet’s streaming detector
 	///   3. Default to UTF‑8          ← no further fall‑backs
+	///
+	/// - Important: Deprecated for any read whose result may be written back.
+	///   Non-text outcomes come back in-band (`nil` for binary; for files of
+	///   2 MB and more, the placeholder strings `"[File too large: N bytes]"`
+	///   and `"[Binary data or unknown encoding]"`), and editing and saving such
+	///   a string replaces the whole file. Use
+	///   `readFileContent(atRelativePath:sizeLimit:)`, which reports those
+	///   outcomes as `WorkspaceFileReadResult` cases. Kept source-compatible
+	///   until consumers have moved.
 	public func loadEntireFileContentOptimized(
 		ofRelativePath relativePath: String,
 		chunkSize: Int = 1_048_576,          // 1 MB
@@ -4794,8 +4830,136 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 			encoding = .utf8           // no secondary heuristics
 		}
 		
-		encodingMap[encodingKey] = encoding
+		recordEncoding(
+			encoding,
+			hasByteOrderMark: Self.detectBOMEncoding(in: initialData) == encoding,
+			forKey: encodingKey
+		)
 		return String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]"
+	}
+
+	/// Default byte limit of `readFileContent(atRelativePath:sizeLimit:)`.
+	public static let defaultTextReadSizeLimit: Int64 = 10_000_000
+
+	/// Reads `relativePath` as text and reports every other outcome as a
+	/// status. **This is the API to use for any read whose result may be
+	/// written back** (edits, search-and-replace, apply-edits hosts): a file
+	/// that is too large, binary or not decodable comes back as
+	/// `.tooLarge` / `.binary` / `.undecodable`, never as content.
+	///
+	/// A `.text` result records the encoding and byte-order mark for the
+	/// path, so a following `editFile` writes the file back in the same
+	/// encoding and keeps the mark.
+	///
+	/// - Parameter sizeLimit: Files larger than this many bytes are not read
+	///   (`.tooLarge`). Negative values are treated as zero.
+	/// - Throws: `FileSystemError.invalidRelativePath` for a path outside the
+	///   root, `.fileNotFound`, `.isDirectory`, or the underlying I/O error.
+	public func readFileContent(
+		atRelativePath relativePath: String,
+		sizeLimit: Int64 = FileSystemService.defaultTextReadSizeLimit
+	) async throws -> WorkspaceFileReadResult {
+		let limit = max(0, sizeLimit)
+		let key = try containedRelativePath(relativePath)
+		let ext = (key as NSString).pathExtension.lowercased()
+		if !ext.isEmpty, Self.alwaysBinaryExtensions.contains(ext) {
+			return .binary
+		}
+
+		let fm = self.fm
+		let fullPath = getFullPath(forRelativePath: key)
+		var isDirectory = ObjCBool(false)
+		guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
+			throw FileSystemError.fileNotFound
+		}
+		guard !isDirectory.boolValue else { throw FileSystemError.isDirectory }
+		let fileSize = try fm.attributesOfItem(atPath: fullPath)[.size] as? Int64 ?? 0
+		if fileSize > limit {
+			return .tooLarge(byteCount: fileSize, limit: limit)
+		}
+
+		let url = URL(fileURLWithPath: fullPath)
+		let handle = try FileHandle(forReadingFrom: url)
+		defer { try? handle.close() }
+		var data = Data()
+		data.reserveCapacity(Int(fileSize))
+		while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+			data.append(chunk)
+			if Int64(data.count) > limit {
+				// The file grew past the limit while it was being read.
+				return .tooLarge(byteCount: Int64(data.count), limit: limit)
+			}
+			try Task.checkCancellation()
+		}
+
+		let byteOrderMarkEncoding = Self.detectBOMEncoding(in: data)
+		let skipProbe = byteOrderMarkEncoding != nil
+			|| Self.alwaysTextExtensions.contains(ext)
+			|| (ext.isEmpty && Self.alwaysTextFilenames.contains(url.lastPathComponent.lowercased()))
+		if !skipProbe && Self.isProbablyBinary(data) {
+			return .binary
+		}
+
+		let result = decodeText(data, byteOrderMarkEncoding: byteOrderMarkEncoding)
+		if case .text(_, let encoding, let hasByteOrderMark) = result {
+			recordEncoding(encoding, hasByteOrderMark: hasByteOrderMark, forKey: key)
+		}
+		return result
+	}
+
+	/// `readFileContent(atRelativePath:sizeLimit:)` plus the file's
+	/// modification date, for callers that detect concurrent changes.
+	public func readFileContentWithDate(
+		atRelativePath relativePath: String,
+		sizeLimit: Int64 = FileSystemService.defaultTextReadSizeLimit
+	) async throws -> (result: WorkspaceFileReadResult, modificationDate: Date) {
+		let modificationDate = try await getFileModificationDate(atRelativePath: try containedRelativePath(relativePath))
+		let result = try await readFileContent(atRelativePath: relativePath, sizeLimit: sizeLimit)
+		return (result, modificationDate)
+	}
+
+	/// Decodes a whole file: a byte-order mark decides the encoding (and is
+	/// not part of the text), then strict UTF-8, then the charset detector.
+	private func decodeText(_ data: Data, byteOrderMarkEncoding: String.Encoding?) -> WorkspaceFileReadResult {
+		if data.isEmpty {
+			return .text("", encoding: .utf8, hasByteOrderMark: false)
+		}
+		if let encoding = byteOrderMarkEncoding, let mark = Self.byteOrderMark(for: encoding) {
+			guard let text = String(data: data.dropFirst(mark.count), encoding: encoding) else {
+				return .undecodable(encoding: encoding)
+			}
+			return .text(text, encoding: encoding, hasByteOrderMark: true)
+		}
+		if let text = String(data: data, encoding: .utf8) {
+			return .text(text, encoding: .utf8, hasByteOrderMark: false)
+		}
+		let encoding = detectEncodingFull(data, detector: charsetDetector)
+		guard let text = String(data: data, encoding: encoding) else {
+			return .undecodable(encoding: encoding)
+		}
+		return .text(text, encoding: encoding, hasByteOrderMark: false)
+	}
+
+	private func recordEncoding(_ encoding: String.Encoding, hasByteOrderMark: Bool, forKey key: String) {
+		encodingMap[key] = encoding
+		if hasByteOrderMark {
+			byteOrderMarkPaths.insert(key)
+		} else {
+			byteOrderMarkPaths.remove(key)
+		}
+	}
+
+	/// The byte-order mark `editFile` writes for `encoding`, or nil for
+	/// encodings without one (or that emit their own, like `.utf16`).
+	private static func byteOrderMark(for encoding: String.Encoding) -> Data? {
+		switch encoding {
+		case .utf8: return Data([0xEF, 0xBB, 0xBF])
+		case .utf16LittleEndian: return Data([0xFF, 0xFE])
+		case .utf16BigEndian: return Data([0xFE, 0xFF])
+		case .utf32LittleEndian: return Data([0xFF, 0xFE, 0x00, 0x00])
+		case .utf32BigEndian: return Data([0x00, 0x00, 0xFE, 0xFF])
+		default: return nil
+		}
 	}
 	
 	/// Attempt to decode with all post‑UTF‑8 fall‑backs, including region‑specific ones.
@@ -4966,8 +5130,8 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		}
 		
 		// --- 2. in-memory bookkeeping (still inside actor) --------------
-		// update encoding cache (new files default to UTF-8)
-		encodingMap[relativePath] = .utf8
+		// update encoding cache (new files default to UTF-8, no byte-order mark)
+		recordEncoding(.utf8, hasByteOrderMark: false, forKey: relativePath)
 		
 		// update visited* sets
 		if !visitedPaths.contains(relativePath) {
@@ -5006,6 +5170,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		}
 		for key in keysToForget {
 			encodingMap.removeValue(forKey: key)
+			byteOrderMarkPaths.remove(key)
 		}
 
 		var deltas = removeSubtree(for: normalizedRelativePath)
@@ -5056,6 +5221,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		}
 		for key in keysToForget {
 			encodingMap.removeValue(forKey: key)
+			byteOrderMarkPaths.remove(key)
 		}
 		
 		var deltas = removeSubtree(for: normalizedRelativePath)
@@ -5091,16 +5257,23 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 			throw FileSystemError.fileNotFound
 		}
 		let enc = encodingMap[relativePath] ?? .utf8
-		guard let data = newContent.data(using: enc) else {
+		guard var data = newContent.data(using: enc) else {
 			throw FileSystemError.failedToEditFile(
 				NSError(domain: "encoding", code: -1,
 						userInfo: [NSLocalizedDescriptionKey: "Unable to encode text as \(enc)"]))
 		}
 		
+		if byteOrderMarkPaths.contains(relativePath),
+			let mark = Self.byteOrderMark(for: enc),
+			!data.starts(with: mark) {
+			data = mark + data
+		}
+		let payload = data
+		
 		// --- 1. do I/O off-actor ----------------------------------------
 		do {
 			try await Task.detached(priority: .utility) {
-				try FileSystemService.writeFileRobust(to: fullURL, data: data)
+				try FileSystemService.writeFileRobust(to: fullURL, data: payload)
 			}.value                                    // bubbles error
 		} catch {
 			throw FileSystemError.failedToEditFile(error)
@@ -5438,13 +5611,18 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		
 		// 0 --> return empty string immediately  ✅
 		if data.isEmpty {
-			return DetectedText(string: "", encoding: .utf8)
+			return DetectedText(string: "", encoding: .utf8, hasByteOrderMark: false)
 		}
 		
+		// A leading byte-order mark in the decoding encoding is recorded so
+		// `editFile` can write it back (`String(data:encoding:)` drops a
+		// UTF-8 mark silently).
+		let byteOrderMarkEncoding = Self.detectBOMEncoding(in: data)
+
 		// 1) Fast-path: strict UTF-8 validation over the *whole* buffer
 		//    This is safe because the initializer is length-aware.
 		if let utf8String = String(data: data, encoding: .utf8) {
-			return DetectedText(string: utf8String, encoding: .utf8)
+			return DetectedText(string: utf8String, encoding: .utf8, hasByteOrderMark: byteOrderMarkEncoding == .utf8)
 		}
 		
 		
@@ -5453,7 +5631,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		guard let str = String(data: data, encoding: enc) else {
 			throw FileSystemError.failedToReadFile
 		}
-		return DetectedText(string: str, encoding: enc)
+		return DetectedText(string: str, encoding: enc, hasByteOrderMark: byteOrderMarkEncoding == enc)
 	}
 	
 	/// Quick heuristic: UTF‑16 text usually contains many NUL bytes.
@@ -6450,6 +6628,8 @@ public extension URL {
 public struct DetectedText {
 	public let string: String
 	public let encoding: String.Encoding
+	/// The file starts with a Unicode byte-order mark for `encoding`.
+	public var hasByteOrderMark: Bool = false
 }
 
 /// Convert an IANA charset label (e.g. "windows-1252") to `String.Encoding`.
