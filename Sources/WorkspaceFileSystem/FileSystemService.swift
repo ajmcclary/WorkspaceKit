@@ -6524,98 +6524,154 @@ public extension FileSystemService {
 		try data.write(to: url, options: .atomic)   // blocking write
 	}
 	
-	/// Robust write that works across external/network volumes:
-	/// 1) try atomic write
-	/// 2) write to temp in the same directory then move into place (delete destination if needed)
-	/// 3) POSIX open(O_CREAT|O_TRUNC)+write+fsync fallback
-	private static func writeFileRobust(
-		to url: URL,
-		data: Data
-	) throws {
-		// Fast path: try Foundation's atomic write first.
-		do {
-			try data.write(to: url, options: [.atomic])
-			return
-		} catch {
-			// fall through to robust fallbacks
-		}
-		
-		let fm = FileManager.default
-		let dirURL = url.deletingLastPathComponent()
-		let tmpURL = dirURL.appendingPathComponent(".repoprompt.tmp.\(UUID().uuidString)")
-		
-		// Fallback #1: write to temp in the same directory then move/replace.
-		do {
-			try data.write(to: tmpURL, options: [])
-			if fm.fileExists(atPath: url.path) {
-				// Removing the destination first avoids exchange/rename restrictions on some filesystems
-				// (exFAT/SMB may reject replace semantics).
-				try? fm.removeItem(at: url)
-			}
-			try fm.moveItem(at: tmpURL, to: url)
-			return
-		} catch {
-			// Clean up temp if it remains
-			try? fm.removeItem(at: tmpURL)
-		}
-		
-		// Fallback #2: POSIX open/write/fsync.
-		try writeFilePOSIX(to: url, data: data)
-	}
-	
-	/// Low-level write that avoids Foundation's atomic/replace semantics entirely.
-	private static func writeFilePOSIX(
+	/// Writes `data` to `url` without ever leaving an existing destination
+	/// missing, empty or partially written because the write failed.
+	///
+	/// 1. Write a temp file in the destination's directory, carry the
+	///    destination's mode, ACL and extended attributes (Finder tags,
+	///    comments) over to it, and `rename(2)` it into place (atomic).
+	/// 2. If the volume refuses to rename over an existing file, move the
+	///    original aside, move the temp in, then delete the original; if the
+	///    second step fails the original is moved back.
+	/// 3. Only when no temp file can be created because the directory is not
+	///    writable (EACCES/EPERM) while the file is, rewrite the file in place;
+	///    if that write fails the original bytes are written back.
+	///
+	/// Any other failure (disk full, quota, I/O error, read-only volume) is
+	/// thrown with the destination untouched. The destination path is used
+	/// as given; callers resolve symlinks first (a symlink at `url` is
+	/// replaced in steps 1–2 and refused in step 3). Steps 1–2 replace the
+	/// directory entry, so other hard links to the file keep the old bytes;
+	/// step 3 keeps them.
+	static func writeFileRobust(
 		to url: URL,
 		data: Data
 	) throws {
 		let path = url.path
-		let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-		if fd == -1 {
-			let code = errno
-			throw NSError(
-				domain: NSPOSIXErrorDomain,
-				code: Int(code),
-				userInfo: [NSLocalizedDescriptionKey: "open() failed for \(path) (\(code))"]
-			)
-		}
-		
-		var writeError: Int32 = 0
-		data.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) in
-			guard var base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-			var remaining = data.count
-			while remaining > 0 {
-				let n = Darwin.write(fd, base, remaining)
-				if n < 0 {
-					writeError = errno
-					break
+		let directory = (path as NSString).deletingLastPathComponent
+		var destinationInfo = stat()
+		let destinationExists = lstat(path, &destinationInfo) == 0
+		let destinationIsRegularFile = destinationExists && (destinationInfo.st_mode & S_IFMT) == S_IFREG
+
+		let tempPath = (directory as NSString).appendingPathComponent(".repoprompt.tmp.\(UUID().uuidString)")
+		let createError = writeNewFilePOSIX(
+			atPath: tempPath,
+			data: data,
+			mode: destinationIsRegularFile ? mode_t(destinationInfo.st_mode & 0o7777) : nil
+		)
+		if createError == 0 {
+			if destinationIsRegularFile {
+				// Best effort: losing an xattr is not a reason to fail the save.
+				_ = copyfile(path, tempPath, nil, copyfile_flags_t(COPYFILE_XATTR | COPYFILE_ACL))
+			}
+			if rename(tempPath, path) == 0 { return }
+			let renameError = errno
+			if destinationExists {
+				let backupPath = (directory as NSString).appendingPathComponent(".repoprompt.tmp.bak.\(UUID().uuidString)")
+				if rename(path, backupPath) == 0 {
+					if rename(tempPath, path) == 0 {
+						unlink(backupPath)
+						return
+					}
+					let swapError = errno
+					rename(backupPath, path)
+					unlink(tempPath)
+					throw posixError(swapError, "rename", path)
 				}
-				remaining -= n
-				base = base.advanced(by: n)
 			}
+			unlink(tempPath)
+			throw posixError(renameError, "rename", path)
 		}
-		
-		if writeError == 0 {
-			if fsync(fd) != 0 {
-				writeError = errno
+
+		guard destinationIsRegularFile, createError == EACCES || createError == EPERM else {
+			throw posixError(createError, "write", tempPath)
+		}
+		try rewriteFileInPlacePOSIX(atPath: path, data: data)
+	}
+
+	private static func posixError(_ code: Int32, _ operation: String, _ path: String) -> NSError {
+		NSError(
+			domain: NSPOSIXErrorDomain,
+			code: Int(code),
+			userInfo: [NSLocalizedDescriptionKey: "\(operation) failed for \(path) (\(code))"]
+		)
+	}
+
+	/// Writes every byte of `bytes` to `fd`, retrying on EINTR and short
+	/// writes. Returns 0 or the failing errno.
+	private static func writeAll(_ fd: Int32, _ bytes: UnsafeRawBufferPointer) -> Int32 {
+		guard var base = bytes.baseAddress else { return 0 }
+		var remaining = bytes.count
+		while remaining > 0 {
+			let written = Darwin.write(fd, base, remaining)
+			if written < 0 {
+				if errno == EINTR { continue }
+				return errno
 			}
+			if written == 0 { return EIO }
+			remaining -= written
+			base = base.advanced(by: written)
 		}
-		
-		// Always attempt to close; prefer first error if any.
-		let closeResult = close(fd)
-		if writeError != 0 {
-			throw NSError(
-				domain: NSPOSIXErrorDomain,
-				code: Int(writeError),
-				userInfo: [NSLocalizedDescriptionKey: "write/fsync failed for \(path) (\(writeError))"]
-			)
+		return 0
+	}
+
+	/// Creates `path` exclusively (never following or replacing anything that
+	/// is already there) and writes `data` to it. On failure the partial file
+	/// is removed. Returns 0 or the failing errno.
+	private static func writeNewFilePOSIX(atPath path: String, data: Data, mode: mode_t?) -> Int32 {
+		let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+		if fd == -1 { return errno }
+		var failure: Int32 = 0
+		if let mode, fchmod(fd, mode) != 0 {
+			failure = errno
 		}
-		if closeResult != 0 {
-			let code = errno
-			throw NSError(
-				domain: NSPOSIXErrorDomain,
-				code: Int(code),
-				userInfo: [NSLocalizedDescriptionKey: "close() failed for \(path) (\(code))"]
-			)
+		if failure == 0 {
+			failure = data.withUnsafeBytes { writeAll(fd, $0) }
+		}
+		if close(fd) != 0, failure == 0 {
+			failure = errno
+		}
+		if failure != 0 {
+			unlink(path)
+		}
+		return failure
+	}
+
+	/// In-place rewrite for a writable file in a directory where no temp file
+	/// can be created. The original bytes are read first and written back if
+	/// the new write fails, so a failure does not leave the file truncated.
+	private static func rewriteFileInPlacePOSIX(atPath path: String, data: Data) throws {
+		let fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+		if fd == -1 {
+			throw posixError(errno, "open", path)
+		}
+		defer { close(fd) }
+
+		var original = Data()
+		var chunk = [UInt8](repeating: 0, count: 65_536)
+		while true {
+			let count = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+			if count < 0 {
+				if errno == EINTR { continue }
+				throw posixError(errno, "read", path)
+			}
+			if count == 0 { break }
+			original.append(contentsOf: chunk[0..<count])
+		}
+
+		func replaceContents(with bytes: Data) -> Int32 {
+			if lseek(fd, 0, SEEK_SET) == -1 { return errno }
+			let failure = bytes.withUnsafeBytes { writeAll(fd, $0) }
+			if failure != 0 { return failure }
+			if ftruncate(fd, off_t(bytes.count)) != 0 { return errno }
+			if fsync(fd) != 0 { return errno }
+			return 0
+		}
+
+		let failure = replaceContents(with: data)
+		if failure != 0 {
+			_ = replaceContents(with: original)
+			throw posixError(failure, "write", path)
 		}
 	}
 }
