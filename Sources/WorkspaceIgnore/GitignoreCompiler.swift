@@ -649,6 +649,19 @@ public struct CompiledIgnoreRules: Sendable {
 			return summarizeSlashFreeBasenamePattern(basenamePattern)
 		}
 
+		// `<dir>/**/<basename>` (how a slash-free pattern of a nested ignore
+		// file is scoped) is a basename pattern for leaves below `<dir>`.
+		if pattern.absolute, let range = value.range(of: "/**/") {
+			let base = String(value[..<range.lowerBound])
+			let basename = String(value[range.upperBound...])
+			if !base.isEmpty, !base.contains("*"), !basename.isEmpty, !basename.contains("/") {
+				guard parentPath == base || parentPath.hasPrefix(base + "/") else {
+					return .irrelevant
+				}
+				return summarizeSlashFreeBasenamePattern(basename)
+			}
+		}
+
 		if starCount > 0 {
 			guard !pattern.absolute, !containsSlash else {
 				return .unsupported
@@ -855,26 +868,41 @@ public final class GitignoreCompiler {
 					}
 					
 					let anchoredToIgnoreFileDirectory = parsedPattern.absolute || patternStr.contains("/")
+					let prefix = directoryPath.hasSuffix("/") ? String(directoryPath.dropLast()) : directoryPath
 					var adjustedPattern = patternStr
-					if anchoredToIgnoreFileDirectory && !directoryPath.isEmpty {
-						let prefix = directoryPath.hasSuffix("/") ? String(directoryPath.dropLast()) : directoryPath
-						if !prefix.isEmpty {
+					var absolute = anchoredToIgnoreFileDirectory
+					var prefilter = makePrefilter(
+						pattern: patternStr,
+						directoryOnly: parsedPattern.directory_only,
+						absolute: anchoredToIgnoreFileDirectory
+					)
+					if !prefix.isEmpty {
+						if anchoredToIgnoreFileDirectory {
 							adjustedPattern = "\(prefix)/\(adjustedPattern)"
+							prefilter = makePrefilter(
+								pattern: adjustedPattern,
+								directoryOnly: parsedPattern.directory_only,
+								absolute: true
+							)
+						} else {
+							// A slash-free pattern in a nested ignore file matches
+							// at any depth *below* that file's directory, never the
+							// directory's own ancestors: scope it as `<dir>/**/<p>`
+							// (matched against root-relative paths). The basename
+							// prefilter of the bare pattern stays a valid necessary
+							// condition.
+							adjustedPattern = "\(prefix)/**/\(patternStr)"
+							absolute = true
 						}
 					}
 
 					let interned = PatternPool.shared.intern(adjustedPattern)
-					let prefilter = makePrefilter(
-						pattern: interned,
-						directoryOnly: parsedPattern.directory_only,
-						absolute: anchoredToIgnoreFileDirectory
-					)
 					
 					let pat = GitPattern(
 						pattern: interned,
 						isNegation: parsedPattern.is_negation,
 						directoryOnly: parsedPattern.directory_only,
-						absolute: anchoredToIgnoreFileDirectory,
+						absolute: absolute,
 						prefilter: prefilter
 					)
 					patterns.append(pat)
