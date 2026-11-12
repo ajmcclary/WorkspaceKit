@@ -476,6 +476,17 @@ public actor FileSystemService {
 	private var pendingScanTargets: [String: FSEventStreamEventId] = [:]
 	/// Maps folder relative path → highest FSEvent ID that has already been scanned
 	private var lastScannedEventIdByFolder: [String: FSEventStreamEventId] = [:]
+	/// Eligible folders a batch could not scan because of `maxFoldersPerBatch`;
+	/// their event IDs stay in `pendingScanTargets` and the next pass scans
+	/// them without waiting for another event.
+	private var deferredFolderScans: Set<String> = []
+	/// Subtrees to re-walk and diff against `visitedPaths` because FSEvents
+	/// reported (or the overflow collapse implies) that events were lost.
+	private var pendingSubtreeReconciles: Set<String> = []
+	/// Event ID captured before the first initial walk while no stream runs;
+	/// the stream starts from it so changes during and after the walk are
+	/// replayed instead of lost.
+	private var streamStartEventId: FSEventStreamEventId?
 
 
 	/// Short-lived cache
@@ -2040,7 +2051,7 @@ public actor FileSystemService {
 		let events = takePendingFSEventsForProcessing()
 
 		// Process immediately and publish deltas (if any)
-		if !events.isEmpty {
+		if !events.isEmpty || !deferredFolderScans.isEmpty || !pendingSubtreeReconciles.isEmpty {
 			_ = await handleBatchedEvents(events)
 		}
 	}
@@ -2096,12 +2107,18 @@ public actor FileSystemService {
 			| kFSEventStreamCreateFlagNoDefer
 		)
 
+		// Replay from just before the initial walk (when one ran while no
+		// stream existed): changes made during the walk, or between the walk
+		// and this start, would otherwise never be reported.
+		let sinceWhen = streamStartEventId ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+		streamStartEventId = nil
+
 		fseventStreamRef = FSEventStreamCreate(
 			kCFAllocatorDefault,
 			Self.fseventCallback,
 			&streamContext,
 			[path] as CFArray,
-			FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+			sinceWhen,
 			0,
 			flags
 		)
@@ -2321,11 +2338,16 @@ public actor FileSystemService {
 			_ = await handleBatchedEvents(events)
 			coalescingTask = nil
 			
-			// Re-arm if more events arrived while handling
-			if !pendingFSEvents.isEmpty {
+			// Re-arm if more events arrived while handling, or folders beyond
+			// the per-batch cap are still waiting for their scan.
+			if hasPendingWatcherWork {
 				scheduleCoalescingIfNeeded()
 			}
 		}
+	}
+
+	private var hasPendingWatcherWork: Bool {
+		!pendingFSEvents.isEmpty || !deferredFolderScans.isEmpty || !pendingSubtreeReconciles.isEmpty
 	}
 
 	private func collapsePendingEventsToRootRescan(upTo eventID: FSEventStreamEventId) {
@@ -2359,6 +2381,8 @@ public actor FileSystemService {
 		pendingFSEvents.removeAll(keepingCapacity: false)
 		hasPendingOverflowRescan = false
 		overflowChangedIgnoreDirs.removeAll(keepingCapacity: false)
+		deferredFolderScans.removeAll(keepingCapacity: false)
+		pendingSubtreeReconciles.removeAll(keepingCapacity: false)
 		pendingScanTargets.removeAll(keepingCapacity: false)
 		lastScannedEventIdByFolder.removeAll(keepingCapacity: false)
 		lastVerifiedAtByFolder.removeAll(keepingCapacity: false)
@@ -2764,7 +2788,9 @@ public actor FileSystemService {
 		_ events: [(String, FSEventStreamEventFlags, FSEventStreamEventId)],
 		testMode: Bool = false
 	) async -> [FileSystemDelta]? {
-		guard !events.isEmpty else { return testMode ? [] : nil }
+		guard !events.isEmpty || !deferredFolderScans.isEmpty || !pendingSubtreeReconciles.isEmpty else {
+			return testMode ? [] : nil
+		}
 
 		#if DEBUG
 		if Self.enableDebugLogging {
@@ -2832,6 +2858,11 @@ public actor FileSystemService {
 			if isRepoPromptTempPath(relPath) {
 				continue
 			}
+
+			// End-of-replay marker of a stream started from a past event ID.
+			if (flags & FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone)) != 0 {
+				continue
+			}
 			
 #if DEBUG
 			if isTestMode && Self.enableDebugLogging {
@@ -2857,6 +2888,12 @@ public actor FileSystemService {
 			if parsed.requiresAggressiveScan {
 				// Schedule root scan for comprehensive recovery
 				trackFolder("", eventId: eventId)
+				// A one-level scan cannot see changes inside existing
+				// subdirectories: re-walk the affected subtree (the event's
+				// path for MustScanSubDirs, the whole tree when events were
+				// dropped or the root changed) and diff it.
+				let subtree = (parsed.mustScanSubdirs && !parsed.userOrKernelDropped && !parsed.rootChanged) ? relPath : ""
+				pendingSubtreeReconciles.insert(subtree)
 				#if DEBUG
 				if isTestMode && Self.enableDebugLogging {
 					print("DEBUG: Aggressive scan required - mustScan=\(parsed.mustScanSubdirs), dropped=\(parsed.userOrKernelDropped), rootChanged=\(parsed.rootChanged)")
@@ -3245,6 +3282,10 @@ public actor FileSystemService {
 			pendingScanTargets[folder] = max(pendingScanTargets[folder] ?? 0, maxId)
 		}
 		
+		// Folders a previous batch could not reach because of the batch cap.
+		foldersToScan.formUnion(deferredFolderScans)
+		deferredFolderScans.removeAll(keepingCapacity: true)
+
 		// Build eligible set: folders that need scanning
 		// - nil lastScannedId means "never scanned" → always eligible
 		// - Otherwise, only rescan if pendingId > lastScannedId
@@ -3277,11 +3318,14 @@ public actor FileSystemService {
 					}
 				}
 				
-				let folderDeltas = try await scanFoldersInParallel(eligibleFolders)
+				let (folderDeltas, scannedFolders) = try await scanFoldersInParallel(eligibleFolders)
 				allDeltas.append(contentsOf: folderDeltas)
+				// Folders beyond the batch cap keep their pending event ID and
+				// are scanned by the next pass (re-armed below).
+				deferredFolderScans.formUnion(eligibleFolders.subtracting(scannedFolders))
 				
 				// Update tracking for successfully scanned folders
-				for folder in eligibleFolders {
+				for folder in scannedFolders {
 					if let pendingId = pendingScanTargets[folder] {
 						lastScannedEventIdByFolder[folder] = pendingId
 						pendingScanTargets.removeValue(forKey: folder)
@@ -3311,6 +3355,23 @@ public actor FileSystemService {
 			}
 		}
 		
+		if !pendingSubtreeReconciles.isEmpty {
+			// The root subsumes every other subtree.
+			let targets = pendingSubtreeReconciles.contains("")
+				? [""]
+				: pendingSubtreeReconciles.filter { candidate in
+					!pendingSubtreeReconciles.contains { other in other != candidate && candidate.hasPrefix(other + "/") }
+				}
+			pendingSubtreeReconciles.removeAll(keepingCapacity: true)
+			for subtree in targets {
+				do {
+					allDeltas.append(contentsOf: try await reconcileSubtree(subtree))
+				} catch {
+					print("Error reconciling subtree '\(subtree)': \(error)")
+				}
+			}
+		}
+
 		#if DEBUG
 		if Self.enableDebugLogging {
 			print("┌─────────────────────────────────────────────────────────────")
@@ -3346,6 +3407,10 @@ public actor FileSystemService {
 			changePublisher.send(publishableDeltas)
 		}
 		FileSystemPublishPerf.end("coalesceAndPublishFileSystemDeltas", publishSignpost)
+		if (!deferredFolderScans.isEmpty || !pendingSubtreeReconciles.isEmpty) {
+			// No-op inside the coalescing task (it re-arms itself afterwards).
+			scheduleCoalescingIfNeeded()
+		}
 
 		// Flush the split-components cache; next scan will repopulate lazily.
 		pathCompsCache.removeAll()
@@ -3658,8 +3723,10 @@ public actor FileSystemService {
 	
 	/// Scan multiple folders in parallel for better I/O performance.
 	/// Uses configurable caps to prevent CPU saturation.
-	private func scanFoldersInParallel(_ folders: Set<String>) async throws -> [FileSystemDelta] {
-		guard !folders.isEmpty else { return [] }
+	/// Returns the deltas and the folders actually scanned: at most
+	/// `maxFoldersPerBatch` of `folders`; the caller defers the rest.
+	private func scanFoldersInParallel(_ folders: Set<String>) async throws -> (deltas: [FileSystemDelta], scanned: Set<String>) {
+		guard !folders.isEmpty else { return ([], []) }
 		
 		// In test mode, always use serial scanning to avoid thread safety issues with SpyFS
 		#if DEBUG
@@ -3669,7 +3736,7 @@ public actor FileSystemService {
 				let folderDeltas = try await scanOneLevelAndDiff(folder)
 				deltas.append(contentsOf: folderDeltas)
 			}
-			return deltas
+			return (deltas, folders)
 		}
 		#endif
 		
@@ -3689,7 +3756,7 @@ public actor FileSystemService {
 				let folderDeltas = try await scanOneLevelAndDiff(folder)
 				deltas.append(contentsOf: folderDeltas)
 			}
-			return deltas
+			return (deltas, cappedFolders)
 		}
 		
 		// Use parallel scanning for larger sets with BOUNDED CONCURRENCY
@@ -3796,7 +3863,7 @@ public actor FileSystemService {
 			}
 		}
 		
-		return aggregatedDeltas
+		return (aggregatedDeltas, cappedFolders)
 	}
 	
 	// MARK: - Single-level scanning & removal
@@ -3970,6 +4037,53 @@ public actor FileSystemService {
 		return subDeltas
 	}
 	
+	/// Re-walks `folderRelPath` ("" = the whole tree) and diffs it against
+	/// `visitedPaths`: items found that are not tracked are added, tracked
+	/// items under it that no longer exist on disk are removed. Used when
+	/// FSEvents may have lost events (MustScanSubDirs, User/KernelDropped,
+	/// RootChanged, the service's own overflow collapse), where the one-level
+	/// scan only sees the folder's direct children. Tracked items that still
+	/// exist are kept even if the walk skipped them (ignored but tracked, the
+	/// same rule `scanOneLevelAndDiff` applies).
+	private func reconcileSubtree(_ folderRelPath: String) async throws -> [FileSystemDelta] {
+		let absFolder = getFullPath(forRelativePath: folderRelPath)
+		var isDirectory: ObjCBool = false
+		guard fm.fileExists(atPath: absFolder, isDirectory: &isDirectory), isDirectory.boolValue else {
+			// A vanished root reports nothing here; writes refuse to re-create it.
+			return folderRelPath.isEmpty ? [] : removeSubtree(for: folderRelPath)
+		}
+		let found = try await gatherPathsUsingEnumerator(
+			rootURL: URL(fileURLWithPath: absFolder),
+			skipSymlinks: skipSymlinks,
+			baseRelativePath: folderRelPath
+		)
+		var actual: [String: Bool] = [:]
+		actual.reserveCapacity(found.count)
+		for (subRelPath, isDir) in found {
+			actual[folderRelPath.isEmpty ? subRelPath : folderRelPath + "/" + subRelPath] = isDir
+		}
+		let prefix = folderRelPath.isEmpty ? "" : folderRelPath + "/"
+		let tracked = visitedPaths.filter { prefix.isEmpty || $0.hasPrefix(prefix) }
+
+		var deltas: [FileSystemDelta] = []
+		for path in actual.keys.filter({ !tracked.contains($0) }).sorted(by: { $0.count < $1.count }) {
+			if isIgnoreFile(path) { continue }
+			let isDir = actual[path] ?? false
+			visitedPaths.insert(path)
+			visitedItems[path] = isDir
+			deltas.append(isDir ? .folderAdded(path) : .fileAdded(path))
+		}
+		for path in tracked.subtracting(actual.keys).sorted(by: { $0.count > $1.count }) {
+			guard visitedPaths.contains(path) else { continue }
+			if fm.fileExists(atPath: getFullPath(forRelativePath: path), isDirectory: nil) { continue }
+			let wasDir = visitedItems[path] ?? false
+			visitedPaths.remove(path)
+			visitedItems.removeValue(forKey: path)
+			deltas.append(wasDir ? .folderRemoved(path) : .fileRemoved(path))
+		}
+		return deltas
+	}
+
 	/// Removes an entire subtree for a given folder from visitedPaths. Returns .fileRemoved / .folderRemoved deltas.
 	private func removeSubtree(for topRelPath: String) -> [FileSystemDelta] {
 		let oldSet = visitedPaths.filter {
@@ -4064,7 +4178,12 @@ public actor FileSystemService {
 		of folderURL: URL,
 		chunkSize: Int = 200
 	) -> AsyncThrowingStream<LoadContentsEvent, Error> {
-		AsyncThrowingStream { continuation in
+		// Consumers start the stream after the walk; remember where to replay
+		// from so nothing that changes during or after the walk is lost.
+		if fseventStreamRef == nil, streamStartEventId == nil {
+			streamStartEventId = FSEventsGetCurrentEventId()
+		}
+		return AsyncThrowingStream { continuation in
 			let loadingTask = Task {
 				do {
 					try Task.checkCancellation()

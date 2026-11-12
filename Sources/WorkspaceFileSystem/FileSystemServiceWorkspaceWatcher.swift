@@ -9,6 +9,9 @@ import WorkspaceKit
 /// alternative. Deltas map as: added → `.created`, removed → `.deleted`,
 /// modified → `.modified`. The engine reports renames as remove+add pairs,
 /// so `.renamed` is never emitted here.
+///
+/// `startWatching(root:)` walks the whole tree (respecting ignore rules)
+/// before it returns, so pre-existing files are tracked from the start.
 @MainActor
 public final class FileSystemServiceWorkspaceWatcher: WorkspaceFileWatching {
 	private var service: FileSystemService?
@@ -59,6 +62,11 @@ public final class FileSystemServiceWorkspaceWatcher: WorkspaceFileWatching {
 
 		let base = root.standardizedFileURL
 		let deltas = await service.changesStream()
+		// Walk the tree once so files that already exist are known: their first
+		// change is then `.modified`, not `.created`, and a deletion is
+		// reported. The stream replays from just before this walk, so nothing
+		// that changes while it runs is lost.
+		for try await _ in await service.loadContentsInChunks(of: base) {}
 		await service.startWatchingForChanges()
 		forwardingTask = Task { @MainActor [weak self] in
 			for await batch in deltas {
