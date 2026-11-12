@@ -2735,7 +2735,7 @@ public actor FileSystemService {
 	]
 	
 	/// Check if a path looks like a temporary file used for atomic saves
-	private static func isTempSaveName(_ relPath: String) -> Bool {
+	static func isTempSaveName(_ relPath: String) -> Bool {
 		let name = (relPath as NSString).lastPathComponent.lowercased()
 		
 		for suffix in tempNameSuffixes where name.hasSuffix(suffix) {
@@ -2745,8 +2745,15 @@ public actor FileSystemService {
 			return true
 		}
 		
-		// Vim-style hidden swap: .filename.swp
-		if name.hasPrefix(".") && name.contains(".sw") { return true }
+		// Vim-style hidden swap: `.filename.sw[a-p]` only. A looser
+		// `contains(".sw")` also caught `.swiftlint.yml`, `.swiftformat`,
+		// `.swift-version` and `.swcrc`.
+		if name.hasPrefix("."), name.count > 4 {
+			let tail = name.suffix(4)
+			if tail.hasPrefix(".sw"), let last = tail.last, last >= "a", last <= "p" {
+				return true
+			}
+		}
 		
 		return false
 	}

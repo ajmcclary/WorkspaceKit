@@ -151,4 +151,15 @@ final class FileSystemServiceWatcherRecoveryTests: XCTestCase {
 		let seen = await waitUntil { await self.visited(service).contains("src/created-during-load.swift") }
 		XCTAssertTrue(seen, "a file created before the stream started was never reported")
 	}
+
+	// MARK: - Temp-save names
+
+	func testDotfilesContainingSwAreNotEditorTempFiles() {
+		for name in [".swiftlint.yml", ".swiftformat", ".swift-version", ".swcrc", "src/.swiftpm"] {
+			XCTAssertFalse(FileSystemService.isTempSaveName(name), name)
+		}
+		for name in [".main.swift.swp", ".notes.md.swo", ".x.swa", "dir/.y.swp", "file.swx", "a.tmp", "b~"] {
+			XCTAssertTrue(FileSystemService.isTempSaveName(name), name)
+		}
+	}
 }
