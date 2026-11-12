@@ -625,6 +625,21 @@ public enum PathMatcher {
         return nil
     }
     
+    /// Splits a creation path into components. A relative path is collapsed
+    /// lexically first (`.` dropped, `dir/..` folded), and a relative path that
+    /// would climb above its starting folder returns nil: no creation result may
+    /// carry a `..` component, so a create can never leave the chosen root.
+    /// (`NSString.standardizingPath` leaves `..` in relative paths untouched.)
+    private static func creationComponents(standardizedInput: String, isAbsolute: Bool) -> [String]? {
+        let path = isAbsolute ? standardizedInput : StandardizedPath.relative(standardizedInput)
+        let components = path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .split(separator: "/")
+            .map(String.init)
+        guard !components.contains(".."), !components.contains(".") else { return nil }
+        return components
+    }
+
     private static func folderExists(_ fullPath: String,
                               snapshot: PathMatchSnapshot) -> Bool {
         if snapshot.folder(fullPath) != nil { return true }
@@ -654,10 +669,9 @@ public enum PathMatcher {
 
 		let standardizedInput = StandardizedPath.absolute(trimmed)
 		let isAbsolute = standardizedInput.hasPrefix("/")
-		let components = standardizedInput
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            .split(separator: "/")
-            .map(String.init)
+		guard let components = creationComponents(standardizedInput: standardizedInput, isAbsolute: isAbsolute) else {
+			return nil
+		}
         
         guard let fileName = components.last else { return nil }
         let dirComps = Array(components.dropLast())
@@ -1261,10 +1275,9 @@ public enum PathMatcher {
 
 		let standardizedInput = StandardizedPath.absolute(trimmed)
 		let isAbsolute = standardizedInput.hasPrefix("/")
-		let components = standardizedInput
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            .split(separator: "/")
-            .map(String.init)
+		guard let components = creationComponents(standardizedInput: standardizedInput, isAbsolute: isAbsolute) else {
+			return nil
+		}
         
 		guard components.last != nil else { return nil }
         let dirComps = Array(components.dropLast())

@@ -3999,9 +3999,11 @@ public actor FileSystemService {
 				!newRelPath.hasPrefix("/") else {
 			throw FileSystemError.invalidRelativePath
 		}
-		
-		let oldFull = getFullPath(forRelativePath: oldRelPath)
-		let newFull = getFullPath(forRelativePath: newRelPath)
+		// Both ends must stay inside the root, lexically and through symlinked
+		// directories. The source's own leaf is not resolved: moving a symlink
+		// moves the link.
+		let (_, oldFull) = try containedAbsolutePath(forRelativePath: oldRelPath, resolvingLeafSymlink: false)
+		let (_, newFull) = try containedAbsolutePath(forRelativePath: newRelPath, resolvingLeafSymlink: false)
 		
 		// 1) Source must exist
 		guard fm.fileExists(atPath: oldFull, isDirectory: nil) else {
@@ -4031,8 +4033,8 @@ public actor FileSystemService {
 		
 		// --- 2. in-memory bookkeeping (still inside actor) --------------
 		// 5) Immediate in‑memory bookkeeping (fixes race window) ───────────────
-		let stdOld = (oldRelPath as NSString).standardizingPath
-		let stdNew = (newRelPath as NSString).standardizingPath
+		let stdOld = try containedRelativePath(oldRelPath)
+		let stdNew = try containedRelativePath(newRelPath)
 		
 		if let wasDir = visitedItems.removeValue(forKey: stdOld) {
 			visitedItems[stdNew] = wasDir          // will be 'false' for files
@@ -4663,6 +4665,7 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 	}
 
 	let fm = self.fm  // Cache for multiple calls in this method
+	let encodingKey = try containedRelativePath(relativePath)
 	let fullPath = getFullPath(forRelativePath: relativePath)
 	guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
 		throw FileSystemError.fileNotFound
@@ -4689,7 +4692,7 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 	// (3) Small files – read once, detect encoding
 	if fileSize < 2_000_000 {
 		let detected = try readDataAndDetectEncoding(fullPath)
-		encodingMap[relativePath] = detected.encoding
+		encodingMap[encodingKey] = detected.encoding
 		return detected.string
 	}
 
@@ -4733,6 +4736,7 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 
 		let fm = self.fm  // Cache for multiple calls in this method
 		
+		let encodingKey = try containedRelativePath(relativePath)
 		let fullPath = getFullPath(forRelativePath: relativePath)
 		guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
 			throw FileSystemError.fileNotFound
@@ -4790,7 +4794,7 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 			encoding = .utf8           // no secondary heuristics
 		}
 		
-		encodingMap[relativePath] = encoding
+		encodingMap[encodingKey] = encoding
 		return String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]"
 	}
 	
@@ -4925,10 +4929,14 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	}
 	
 	/// Create a new file at `relativePath` with the given content.
-	public func createFile(atRelativePath relativePath: String, content: String) async throws {
+	///
+	/// Throws `FileSystemError.invalidRelativePath`, before any directory is
+	/// created, when the path is the root, climbs above it with `..`, or would
+	/// be written through a symlinked directory that resolves outside the root.
+	public func createFile(atRelativePath rawRelativePath: String, content: String) async throws {
 		let fm = self.fm  // Cache for multiple calls in this method
 		// --- prepare -----------------------------------------------------
-		let fullPath = getFullPath(forRelativePath: relativePath)
+		let (relativePath, fullPath) = try containedAbsolutePath(forRelativePath: rawRelativePath, resolvingLeafSymlink: false)
 		let fullURL = URL(fileURLWithPath: fullPath)
 		
 		// Ensure directory exists (this is fast, keep it in-actor)
@@ -5071,9 +5079,13 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	}
 	
 	/// Re-written non-blocking version
-	public func editFile(atRelativePath relativePath: String, newContent: String) async throws {
+	///
+	/// Throws `FileSystemError.invalidRelativePath` when the path leaves the
+	/// root lexically or through a symlink. A file symlink whose target is
+	/// inside the root is written through (the link is kept).
+	public func editFile(atRelativePath rawRelativePath: String, newContent: String) async throws {
 		// --- prepare -----------------------------------------------------
-		let fullPath = getFullPath(forRelativePath: relativePath)
+		let (relativePath, fullPath) = try containedAbsolutePath(forRelativePath: rawRelativePath, resolvingLeafSymlink: true)
 		let fullURL = URL(fileURLWithPath: fullPath)
 		guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
 			throw FileSystemError.fileNotFound
@@ -6116,7 +6128,80 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		}
 		return (self.path as NSString).appendingPathComponent(sanitized)
 	}
-	
+
+	/// Root-relative form of a caller-supplied path, collapsed lexically.
+	///
+	/// A leading `/` is treated as root-relative (the `getFullPath` convention),
+	/// `.` components are dropped and `dir/..` pairs are folded. Throws
+	/// `invalidRelativePath` when the result is the root itself, climbs above
+	/// the root, or contains a NUL. This is the lexical half of containment;
+	/// `NSString.standardizingPath` is not enough because it leaves `..` in a
+	/// relative path untouched.
+	private func containedRelativePath(_ rawRelativePath: String) throws -> String {
+		guard !StandardizedPath.containsNUL(rawRelativePath) else {
+			throw FileSystemError.invalidRelativePath
+		}
+		let relative = StandardizedPath.relative(rawRelativePath)
+		guard !relative.isEmpty, relative != "..", !relative.hasPrefix("../") else {
+			throw FileSystemError.invalidRelativePath
+		}
+		return relative
+	}
+
+	/// Resolves a caller-supplied relative path to the absolute path a write
+	/// may touch, or throws `invalidRelativePath`.
+	///
+	/// Containment is checked lexically (`containedRelativePath`) and then
+	/// physically: the deepest ancestor of the target that already exists is
+	/// resolved with `realpath` and must lie inside the resolved root, so a
+	/// symlinked directory inside the workspace that points elsewhere cannot be
+	/// written through. With `resolvingLeafSymlink`, an existing target that is
+	/// itself a symlink is resolved as well and the resolved path is returned,
+	/// so an edit writes the link's target (when that target is inside the
+	/// root) instead of replacing the link with a regular file.
+	///
+	/// When the root does not exist on disk (test doubles), only the lexical
+	/// check applies. A symlink swapped in between this check and the write is
+	/// not detected.
+	private func containedAbsolutePath(
+		forRelativePath rawRelativePath: String,
+		resolvingLeafSymlink: Bool
+	) throws -> (relative: String, absolute: String) {
+		let relative = try containedRelativePath(rawRelativePath)
+		let absolute = StandardizedPath.join(standardizedRoot: standardizedRootPath, standardizedRelativePath: relative)
+		guard let realRoot = Self.posixRealPath(standardizedRootPath) else {
+			return (relative, absolute)
+		}
+		func isInsideRoot(_ resolved: String) -> Bool {
+			StandardizedPath.isDescendant(resolved, of: realRoot)
+		}
+
+		var leafInfo = stat()
+		let leafExists = lstat(absolute, &leafInfo) == 0
+		if resolvingLeafSymlink, leafExists, (leafInfo.st_mode & S_IFMT) == S_IFLNK {
+			guard let resolvedLeaf = Self.posixRealPath(absolute),
+				resolvedLeaf != realRoot,
+				isInsideRoot(resolvedLeaf) else {
+				throw FileSystemError.invalidRelativePath
+			}
+			return (relative, resolvedLeaf)
+		}
+
+		// Deepest existing ancestor of the target (the root at the latest).
+		var ancestor = (absolute as NSString).deletingLastPathComponent
+		var ancestorInfo = stat()
+		while lstat(ancestor, &ancestorInfo) != 0 {
+			guard errno == ENOENT, ancestor.count > standardizedRootPath.count else {
+				throw FileSystemError.invalidRelativePath
+			}
+			ancestor = (ancestor as NSString).deletingLastPathComponent
+		}
+		guard let resolvedAncestor = Self.posixRealPath(ancestor), isInsideRoot(resolvedAncestor) else {
+			throw FileSystemError.invalidRelativePath
+		}
+		return (relative, absolute)
+	}
+
 	private enum RelativeEventPath {
 		case inside(relative: String)
 		case outside(originalAbsolute: String)
