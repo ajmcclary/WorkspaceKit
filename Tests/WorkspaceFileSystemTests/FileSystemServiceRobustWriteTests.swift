@@ -72,7 +72,30 @@ final class FileSystemServiceRobustWriteTests: XCTestCase {
 		try FileSystemService.writeFileRobust(to: url, data: Data("new\n".utf8))
 
 		XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "new\n")
-		XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dirURL.path), ["shared.txt"], "temp or backup files left behind")
+		XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dirURL.path), ["shared.txt"], "temp, backup or recovery files left behind")
+	}
+
+	/// If the process dies during an in-place rewrite in a writable directory,
+	/// a recovery copy of the original is on disk next to the file.
+	func testInPlaceRewriteKeepsARecoveryCopyUntilItCompletes() throws {
+		let url = dirURL.appendingPathComponent("shared.txt")
+		let original = Data("the original, longer than the new contents\n".utf8)
+		try original.write(to: url)
+		FileSystemService.simulatedReplaceRenameErrorForTesting.store(EPERM, ordering: .relaxed)
+		FileSystemService.simulatedCrashDuringInPlaceRewriteForTesting.store(true, ordering: .relaxed)
+		defer {
+			FileSystemService.simulatedReplaceRenameErrorForTesting.store(0, ordering: .relaxed)
+			FileSystemService.simulatedCrashDuringInPlaceRewriteForTesting.store(false, ordering: .relaxed)
+		}
+
+		XCTAssertThrowsError(try FileSystemService.writeFileRobust(to: url, data: Data("new\n".utf8)))
+
+		let others = try FileManager.default.contentsOfDirectory(atPath: dirURL.path).filter { $0 != "shared.txt" }
+		XCTAssertEqual(others.count, 1, "expected one recovery copy, found \(others)")
+		if let copy = others.first {
+			XCTAssertTrue(copy.hasPrefix(".repoprompt.tmp."), copy)
+			XCTAssertEqual(try Data(contentsOf: dirURL.appendingPathComponent(copy)), original)
+		}
 	}
 
 	func testWriteKeepsModeAndExtendedAttributes() throws {

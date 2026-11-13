@@ -767,6 +767,10 @@ public actor FileSystemService {
 	/// move aside) an existing destination fail with it, as in a sticky
 	/// directory where the file belongs to another user.
 	nonisolated static let simulatedReplaceRenameErrorForTesting = Atomic<Int32>(0)
+
+	/// Test-only: makes the in-place rewrite stop right after writing the new
+	/// bytes, without rollback or cleanup, as if the process died there.
+	nonisolated static let simulatedCrashDuringInPlaceRewriteForTesting = Atomic<Bool>(false)
 	
 	/// Test-only method to simulate FSEvents and capture the resulting deltas
 	public func simulateFSEvents(
@@ -7103,7 +7107,8 @@ public extension FileSystemService {
 		in directory: ContainedDirectory,
 		data: Data,
 		mode: mode_t?,
-		copyingMetadataFrom metadataSource: String?
+		copyingMetadataFrom metadataSource: String?,
+		durable: Bool = false
 	) -> Int32 {
 		let fd = openat(directory.fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
 		if fd == -1 { return errno }
@@ -7122,6 +7127,9 @@ public extension FileSystemService {
 				close(source)
 			}
 		}
+		if failure == 0, durable, fsync(fd) != 0 {
+			failure = errno
+		}
 		if close(fd) != 0, failure == 0 {
 			failure = errno
 		}
@@ -7134,6 +7142,13 @@ public extension FileSystemService {
 	/// In-place rewrite for a writable file that cannot be replaced by rename.
 	/// The original bytes are read first and written back if the new write
 	/// fails, so a failure does not leave the file truncated.
+	///
+	/// Where the directory is writable (the sticky-directory case), a durable
+	/// recovery copy of the original, `.repoprompt.tmp.<UUID>.recovery-of-<name>`,
+	/// is kept next to the file until the rewrite has been fsynced. If the
+	/// process dies mid-write, the copy holds the original bytes. It is also
+	/// kept when the write fails and the rollback fails too. Where no file can
+	/// be created in the directory, the rewrite runs without one.
 	private static func rewriteFileInPlace(named name: String, in directory: ContainedDirectory, data: Data) throws {
 		let fd = openat(directory.fd, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
 		if fd == -1 {
@@ -7153,19 +7168,44 @@ public extension FileSystemService {
 			original.append(contentsOf: chunk[0..<count])
 		}
 
-		func replaceContents(with bytes: Data) -> Int32 {
+		let uuid = UUID().uuidString
+		let namedRecovery = ".repoprompt.tmp.\(uuid).recovery-of-\(name)"
+		let recoveryName = namedRecovery.utf8.count <= 255 ? namedRecovery : ".repoprompt.tmp.\(uuid).recovery"
+		var originalInfo = stat()
+		let originalMode: mode_t? = fstat(fd, &originalInfo) == 0 ? mode_t(originalInfo.st_mode & 0o7777) : nil
+		let hasRecoveryCopy = writeNewFile(
+			named: recoveryName,
+			in: directory,
+			data: original,
+			mode: originalMode,
+			copyingMetadataFrom: nil,
+			durable: true
+		) == 0
+
+		func replaceContents(with bytes: Data, simulatingCrash: Bool) throws -> Int32 {
 			if lseek(fd, 0, SEEK_SET) == -1 { return errno }
 			let failure = bytes.withUnsafeBytes { writeAll(fd, $0) }
 			if failure != 0 { return failure }
+			#if DEBUG
+			if simulatingCrash, simulatedCrashDuringInPlaceRewriteForTesting.load(ordering: .relaxed) {
+				throw posixError(EINTR, "simulated crash during in-place rewrite of", name)
+			}
+			#endif
 			if ftruncate(fd, off_t(bytes.count)) != 0 { return errno }
 			if fsync(fd) != 0 { return errno }
 			return 0
 		}
 
-		let failure = replaceContents(with: data)
+		let failure = try replaceContents(with: data, simulatingCrash: true)
 		if failure != 0 {
-			_ = replaceContents(with: original)
+			let rollbackFailure = try replaceContents(with: original, simulatingCrash: false)
+			if rollbackFailure == 0, hasRecoveryCopy {
+				unlinkat(directory.fd, recoveryName, 0)
+			}
 			throw posixError(failure, "write", name)
+		}
+		if hasRecoveryCopy {
+			unlinkat(directory.fd, recoveryName, 0)
 		}
 	}
 }
