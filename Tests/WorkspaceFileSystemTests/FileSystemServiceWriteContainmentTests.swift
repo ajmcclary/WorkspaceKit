@@ -89,6 +89,44 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("src/linked.txt"), encoding: .utf8), "ok")
 	}
 
+	func testInRootSymlinksWithRelativeAbsoluteAndChainedTargetsKeepWorking() async throws {
+		let fm = FileManager.default
+		try fm.createDirectory(at: rootURL.appendingPathComponent("lib/deep"), withIntermediateDirectories: true)
+		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("src/up").path, withDestinationPath: "../lib")
+		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("abs").path, withDestinationPath: rootURL.appendingPathComponent("lib").path)
+		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("chain").path, withDestinationPath: "src/up/deep")
+		// Climbs above the root and comes back in by the root's own name.
+		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("around").path, withDestinationPath: "../app/lib")
+		let service = try await makeService()
+
+		try await service.createFile(atRelativePath: "src/up/a.txt", content: "a")
+		try await service.createFile(atRelativePath: "abs/b.txt", content: "b")
+		try await service.createFile(atRelativePath: "chain/c.txt", content: "c")
+		try await service.createFile(atRelativePath: "around/d.txt", content: "d")
+		try await service.editFile(atRelativePath: "chain/c.txt", newContent: "c2")
+
+		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/a.txt"), encoding: .utf8), "a")
+		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/b.txt"), encoding: .utf8), "b")
+		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/deep/c.txt"), encoding: .utf8), "c2")
+		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/d.txt"), encoding: .utf8), "d")
+	}
+
+	func testRootThatIsItselfASymlinkStillAcceptsWrites() async throws {
+		let rootLink = sandboxURL.appendingPathComponent("root-link")
+		try FileManager.default.createSymbolicLink(at: rootLink, withDestinationURL: rootURL)
+		let service = try await FileSystemService(path: rootLink.path, respectGitignore: false, respectRepoIgnore: false, respectCursorignore: false)
+		try await service.createFile(atRelativePath: "src/via-root-link.txt", content: "ok")
+		try await service.moveFile(atRelativePath: "src/via-root-link.txt", toRelativePath: "moved.txt")
+		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("moved.txt"), encoding: .utf8), "ok")
+	}
+
+	func testSymlinkLoopIsRejected() async throws {
+		try FileManager.default.createSymbolicLink(atPath: rootURL.appendingPathComponent("loopA").path, withDestinationPath: "loopB")
+		try FileManager.default.createSymbolicLink(atPath: rootURL.appendingPathComponent("loopB").path, withDestinationPath: "loopA")
+		let service = try await makeService()
+		await assertInvalidRelativePath({ try await service.createFile(atRelativePath: "loopA/x.txt", content: "x") }, "loop")
+	}
+
 	func testCreateFileCollapsesParentTraversalThatStaysInsideTheRoot() async throws {
 		let service = try await makeService()
 		try await service.createFile(atRelativePath: "src/../lib/new.txt", content: "hello")
@@ -167,6 +205,67 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		let service = try await makeService()
 		try await service.moveFile(atRelativePath: "src/a.txt", toRelativePath: "src/../moved/b.txt")
 		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("moved/b.txt"), encoding: .utf8), "keep")
+	}
+
+	func testCreateThroughARegularFileComponentIsAnInvalidPath() async throws {
+		try "x".write(to: rootURL.appendingPathComponent("file.txt"), atomically: true, encoding: .utf8)
+		let service = try await makeService()
+		await assertInvalidRelativePath({ try await service.createFile(atRelativePath: "file.txt/x", content: "y") }, "file.txt/x")
+		await assertInvalidRelativePath({ try await service.createFile(atRelativePath: "file.txt/a/x", content: "y") }, "file.txt/a/x")
+	}
+
+	// MARK: - delete / trash
+
+	func testDeleteThroughSymlinkedDirectoryPointingOutsideIsRejected() async throws {
+		let victim = outsideURL.appendingPathComponent("delvictim.txt")
+		try "keep me".write(to: victim, atomically: true, encoding: .utf8)
+		try FileManager.default.createSymbolicLink(at: rootURL.appendingPathComponent("la"), withDestinationURL: outsideURL)
+		let service = try await makeService()
+
+		await assertInvalidRelativePath({ _ = try await service.deleteFile(atRelativePath: "la/delvictim.txt") }, "delete la/delvictim.txt")
+		await assertInvalidRelativePath({ _ = try await service.moveItemToTrash(atRelativePath: "la/delvictim.txt") }, "trash la/delvictim.txt")
+		XCTAssertTrue(FileManager.default.fileExists(atPath: victim.path))
+	}
+
+	func testDeleteOfASymlinkRemovesTheLinkNotItsTarget() async throws {
+		let victim = outsideURL.appendingPathComponent("target.txt")
+		try "keep me".write(to: victim, atomically: true, encoding: .utf8)
+		try FileManager.default.createSymbolicLink(at: rootURL.appendingPathComponent("file-link"), withDestinationURL: victim)
+		try FileManager.default.createSymbolicLink(at: rootURL.appendingPathComponent("dir-link"), withDestinationURL: outsideURL)
+		let service = try await makeService()
+
+		_ = try await service.deleteFile(atRelativePath: "file-link")
+		_ = try await service.deleteFile(atRelativePath: "dir-link")
+
+		XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: rootURL.appendingPathComponent("file-link").path))
+		XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: rootURL.appendingPathComponent("dir-link").path))
+		XCTAssertEqual(try String(contentsOf: victim, encoding: .utf8), "keep me")
+	}
+
+	func testDeleteOfADirectoryRemovesItsTreeWithoutFollowingLinksInside() async throws {
+		let victim = outsideURL.appendingPathComponent("deep.txt")
+		try "keep me".write(to: victim, atomically: true, encoding: .utf8)
+		let tree = rootURL.appendingPathComponent("tree/sub", isDirectory: true)
+		try FileManager.default.createDirectory(at: tree, withIntermediateDirectories: true)
+		try "a".write(to: tree.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+		try FileManager.default.createSymbolicLink(at: tree.appendingPathComponent("out"), withDestinationURL: outsideURL)
+		let service = try await makeService()
+
+		_ = try await service.deleteFile(atRelativePath: "tree")
+
+		XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.appendingPathComponent("tree").path))
+		XCTAssertEqual(try String(contentsOf: victim, encoding: .utf8), "keep me")
+	}
+
+	func testDeleteThroughSymlinkedDirectoryInsideTheRootStillWorks() async throws {
+		try "x".write(to: rootURL.appendingPathComponent("src/gone.txt"), atomically: true, encoding: .utf8)
+		try FileManager.default.createSymbolicLink(
+			at: rootURL.appendingPathComponent("srclink"),
+			withDestinationURL: rootURL.appendingPathComponent("src")
+		)
+		let service = try await makeService()
+		_ = try await service.deleteFile(atRelativePath: "srclink/gone.txt")
+		XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.appendingPathComponent("src/gone.txt").path))
 	}
 
 	// MARK: - reads

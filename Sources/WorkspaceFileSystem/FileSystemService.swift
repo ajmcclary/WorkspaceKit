@@ -754,6 +754,11 @@ public actor FileSystemService {
 	
 	/// Test-only tracking of processed events
 	private var processedFolders: Set<String> = []
+
+	/// Test-only: a non-zero errno makes every rename that would replace (or
+	/// move aside) an existing destination fail with it, as in a sticky
+	/// directory where the file belongs to another user.
+	nonisolated static let simulatedReplaceRenameErrorForTesting = Atomic<Int32>(0)
 	
 	/// Test-only method to simulate FSEvents and capture the resulting deltas
 	public func simulateFSEvents(
@@ -4159,42 +4164,68 @@ public actor FileSystemService {
 				!newRelPath.hasPrefix("/") else {
 			throw FileSystemError.invalidRelativePath
 		}
-		// Both ends must stay inside the root, lexically and through symlinked
-		// directories. The source's own leaf is not resolved: moving a symlink
-		// moves the link.
-		let (_, oldFull) = try containedAbsolutePath(forRelativePath: oldRelPath, resolvingLeafSymlink: false)
-		let (_, newFull) = try containedAbsolutePath(forRelativePath: newRelPath, resolvingLeafSymlink: false)
-		
-		// 1) Source must exist
-		guard fm.fileExists(atPath: oldFull, isDirectory: nil) else {
-			throw FileSystemError.fileNotFound
-		}
-		
-		// 2) Destination must not exist
-		guard !fm.fileExists(atPath: newFull, isDirectory: nil) else {
-			throw FileSystemError.fileAlreadyExists
-		}
-		
-		// 3) Ensure parent folder exists (this is fast, keep it in-actor)
-		let destDir = (newFull as NSString).deletingLastPathComponent
-		try fm.createDirectory(atPath: destDir,
-										withIntermediateDirectories: true,
-										attributes: nil)
-		
-		// --- 1. do I/O off-actor ----------------------------------------
-		// 4) Perform the move on disk
-		do {
-			try await Task.detached(priority: .utility) {
-				try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
-			}.value                                    // bubbles error
-		} catch {
-			throw FileSystemError.failedToCreateFile(error)
+		// Both ends must stay inside the root, lexically and physically. The
+		// rename runs between the two parent descriptors the containment walk
+		// opened; the source's own leaf is not resolved (moving a symlink moves
+		// the link).
+		let stdOld = try containedRelativePath(oldRelPath)
+		let stdNew = try containedRelativePath(newRelPath)
+		if let root = try openContainedRoot() {
+			let (source, _, sourceLeaf) = try root.openParent(of: Self.components(stdOld), createMissing: false)
+			guard ContainedRoot.entryInfo(sourceLeaf, in: source) != nil else {
+				throw FileSystemError.fileNotFound
+			}
+			// Checked before any destination directory is created.
+			if let probe = try? root.openParent(of: Self.components(stdNew), createMissing: false),
+				ContainedRoot.entryExists(probe.leaf, in: probe.directory) {
+				throw FileSystemError.fileAlreadyExists
+			}
+			let (destination, _, destinationLeaf) = try root.openParent(of: Self.components(stdNew), createMissing: true)
+			let moveError = await Task.detached(priority: .utility) { () -> Int32 in
+				if renameatx_np(source.fd, sourceLeaf, destination.fd, destinationLeaf, UInt32(RENAME_EXCL)) == 0 { return 0 }
+				let error = errno
+				guard error == ENOTSUP || error == EINVAL else { return error }
+				// Volume without RENAME_EXCL: plain rename after the existence check.
+				guard ContainedRoot.entryInfo(destinationLeaf, in: destination) == nil else { return EEXIST }
+				return renameat(source.fd, sourceLeaf, destination.fd, destinationLeaf) == 0 ? 0 : errno
+			}.value
+			if moveError == EEXIST { throw FileSystemError.fileAlreadyExists }
+			if moveError != 0 {
+				throw FileSystemError.failedToCreateFile(ContainedRoot.posixError(moveError, "rename", stdNew))
+			}
+		} else {
+			let oldFull = lexicalAbsolutePath(stdOld)
+			let newFull = lexicalAbsolutePath(stdNew)
+			
+			// 1) Source must exist
+			guard fm.fileExists(atPath: oldFull, isDirectory: nil) else {
+				throw FileSystemError.fileNotFound
+			}
+			
+			// 2) Destination must not exist
+			guard !fm.fileExists(atPath: newFull, isDirectory: nil) else {
+				throw FileSystemError.fileAlreadyExists
+			}
+			
+			// 3) Ensure parent folder exists (this is fast, keep it in-actor)
+			let destDir = (newFull as NSString).deletingLastPathComponent
+			try fm.createDirectory(atPath: destDir,
+											withIntermediateDirectories: true,
+											attributes: nil)
+			
+			// --- 1. do I/O off-actor ----------------------------------------
+			// 4) Perform the move on disk
+			do {
+				try await Task.detached(priority: .utility) {
+					try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
+				}.value                                    // bubbles error
+			} catch {
+				throw FileSystemError.failedToCreateFile(error)
+			}
 		}
 		
 		// --- 2. in-memory bookkeeping (still inside actor) --------------
 		// 5) Immediate in‑memory bookkeeping (fixes race window) ───────────────
-		let stdOld = try containedRelativePath(oldRelPath)
-		let stdNew = try containedRelativePath(newRelPath)
 		
 		if let wasDir = visitedItems.removeValue(forKey: stdOld) {
 			visitedItems[stdNew] = wasDir          // will be 'false' for files
@@ -5265,17 +5296,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	public func createFile(atRelativePath rawRelativePath: String, content: String) async throws {
 		let fm = self.fm  // Cache for multiple calls in this method
 		// --- prepare -----------------------------------------------------
-		let (relativePath, fullPath) = try containedAbsolutePath(forRelativePath: rawRelativePath, resolvingLeafSymlink: false)
-		let fullURL = URL(fileURLWithPath: fullPath)
-		
-		// Ensure directory exists (this is fast, keep it in-actor)
-		let directoryURL = fullURL.deletingLastPathComponent()
-		try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
-		
-		// Check if file already exists
-		if fm.fileExists(atPath: fullPath, isDirectory: nil) {
-			throw FileSystemError.fileAlreadyExists
-		}
+		let relativePath = try containedRelativePath(rawRelativePath)
 		
 		// Prepare data with UTF-8 encoding
 		guard let data = content.data(using: .utf8) else {
@@ -5284,15 +5305,45 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 						userInfo: [NSLocalizedDescriptionKey: "Unable to encode text as UTF-8"]))
 		}
 		
-		// --- 1. do I/O off-actor ----------------------------------------
-		do {
-			try await Task.detached(priority: .utility) {
-				try FileSystemService.writeFileRobust(to: fullURL, data: data)
-			}.value                                    // bubbles error
-			fileSystemDebugLog("File created at \(fullURL.path)")
-		} catch {
-			throw FileSystemError.failedToCreateFile(error)
+		if let root = try openContainedRoot() {
+			// Directories are created and the file written relative to the
+			// descriptors the containment walk opened (no path re-resolution).
+			let (directory, _, leaf) = try root.openParent(of: Self.components(relativePath), createMissing: true)
+			if ContainedRoot.entryExists(leaf, in: directory) {
+				throw FileSystemError.fileAlreadyExists
+			}
+			do {
+				try await Task.detached(priority: .utility) {
+					try FileSystemService.writeFileRobust(inDirectory: directory, name: leaf, data: data, createOnly: true)
+				}.value
+			} catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(EEXIST) {
+				throw FileSystemError.fileAlreadyExists
+			} catch {
+				throw FileSystemError.failedToCreateFile(error)
+			}
+		} else {
+			let fullPath = lexicalAbsolutePath(relativePath)
+			let fullURL = URL(fileURLWithPath: fullPath)
+			
+			// Ensure directory exists (this is fast, keep it in-actor)
+			let directoryURL = fullURL.deletingLastPathComponent()
+			try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
+			
+			// Check if file already exists
+			if fm.fileExists(atPath: fullPath, isDirectory: nil) {
+				throw FileSystemError.fileAlreadyExists
+			}
+			
+			// --- 1. do I/O off-actor ----------------------------------------
+			do {
+				try await Task.detached(priority: .utility) {
+					try FileSystemService.writeFileRobust(to: fullURL, data: data)
+				}.value                                    // bubbles error
+			} catch {
+				throw FileSystemError.failedToCreateFile(error)
+			}
 		}
+		fileSystemDebugLog("File created at \(relativePath)")
 		
 		// --- 2. in-memory bookkeeping (still inside actor) --------------
 		// update encoding cache (new files default to UTF-8, no byte-order mark)
@@ -5309,25 +5360,39 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	}
 	
 	@discardableResult
+	///
+	/// The path is contained like a write: a symlinked ancestor that resolves
+	/// outside the root throws `invalidRelativePath`, and the removal runs
+	/// relative to the parent descriptor the check opened. A symlink at the
+	/// path is removed, never its target; a directory is removed with its
+	/// contents without following symlinks inside it.
 	public func deleteFile(atRelativePath relativePath: String) async throws -> [FileSystemDelta] {
-		let normalizedRelativePath = Self.trimPathSlashes((relativePath as NSString).standardizingPath)
-		guard !normalizedRelativePath.isEmpty,
-			normalizedRelativePath != ".",
-			!normalizedRelativePath.hasPrefix("../"),
-			normalizedRelativePath != ".." else {
-			throw FileSystemError.invalidRelativePath
-		}
-		let fullPath = getFullPath(forRelativePath: normalizedRelativePath)
-		let url = URL(fileURLWithPath: fullPath)
+		let normalizedRelativePath = try containedRelativePath(relativePath)
 		var isDirectory = ObjCBool(false)
-		guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
-			throw FileSystemError.fileNotFound
-		}
-		do {
-			try fm.removeItem(at: url)
-			fileSystemDebugLog("File deleted at \(url.path)")
-		} catch {
-			throw FileSystemError.failedToDeleteFile(error)
+		if let root = try openContainedRoot() {
+			let (directory, _, leaf) = try root.openParent(of: Self.components(normalizedRelativePath), createMissing: false)
+			guard let info = ContainedRoot.entryInfo(leaf, in: directory) else {
+				throw FileSystemError.fileNotFound
+			}
+			isDirectory = ObjCBool((info.st_mode & S_IFMT) == S_IFDIR)
+			do {
+				try ContainedRoot.removeEntry(leaf, in: directory)
+				fileSystemDebugLog("File deleted at \(normalizedRelativePath)")
+			} catch {
+				throw FileSystemError.failedToDeleteFile(error)
+			}
+		} else {
+			let fullPath = lexicalAbsolutePath(normalizedRelativePath)
+			let url = URL(fileURLWithPath: fullPath)
+			guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
+				throw FileSystemError.fileNotFound
+			}
+			do {
+				try fm.removeItem(at: url)
+				fileSystemDebugLog("File deleted at \(url.path)")
+			} catch {
+				throw FileSystemError.failedToDeleteFile(error)
+			}
 		}
 
 		let keysToForget = encodingMap.keys.filter {
@@ -5354,24 +5419,36 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 			throw FileSystemError.invalidRelativePath
 		}
 		
-		let normalizedRelativePath = Self.trimPathSlashes((relativePath as NSString).standardizingPath)
-		guard !normalizedRelativePath.isEmpty,
-			normalizedRelativePath != ".",
-			!normalizedRelativePath.hasPrefix("../"),
-			normalizedRelativePath != ".." else {
-			throw FileSystemError.invalidRelativePath
-		}
+		let normalizedRelativePath = try containedRelativePath(relativePath)
 		
-		let url = rootURL.appendingPathComponent(normalizedRelativePath).standardizedFileURL
-		let fullPath = url.path
-		guard fullPath != standardizedRootPath,
-			hasDirectoryPrefix(fullPath, standardizedRootPath) else {
-			throw FileSystemError.invalidRelativePath
-		}
-		
+		let url: URL
 		var isDirectory = ObjCBool(false)
-		guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
-			throw FileSystemError.fileNotFound
+		if let root = try openContainedRoot() {
+			// The Trash API takes a path, so the item is located by descriptor
+			// walk and then named by its parent's kernel path (`F_GETPATH`),
+			// which must still be inside the root. A directory swapped on that
+			// path between this check and the trash call is not detected (see
+			// the remediation report); the result is a move into the Trash.
+			let (directory, _, leaf) = try root.openParent(of: Self.components(normalizedRelativePath), createMissing: false)
+			guard let info = ContainedRoot.entryInfo(leaf, in: directory) else {
+				throw FileSystemError.fileNotFound
+			}
+			guard let parentPath = directory.currentPath(),
+				StandardizedPath.isDescendant(parentPath, of: root.realPath) else {
+				throw FileSystemError.invalidRelativePath
+			}
+			isDirectory = ObjCBool((info.st_mode & S_IFMT) == S_IFDIR)
+			url = URL(fileURLWithPath: parentPath).appendingPathComponent(leaf)
+		} else {
+			url = rootURL.appendingPathComponent(normalizedRelativePath).standardizedFileURL
+			let fullPath = url.path
+			guard fullPath != standardizedRootPath,
+				hasDirectoryPrefix(fullPath, standardizedRootPath) else {
+				throw FileSystemError.invalidRelativePath
+			}
+			guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
+				throw FileSystemError.fileNotFound
+			}
 		}
 		
 		do {
@@ -5416,11 +5493,19 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	/// inside the root is written through (the link is kept).
 	public func editFile(atRelativePath rawRelativePath: String, newContent: String) async throws {
 		// --- prepare -----------------------------------------------------
-		let (relativePath, fullPath) = try containedAbsolutePath(forRelativePath: rawRelativePath, resolvingLeafSymlink: true)
-		let fullURL = URL(fileURLWithPath: fullPath)
-		guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
-			throw FileSystemError.fileNotFound
+		let relativePath = try containedRelativePath(rawRelativePath)
+		// The file's location, resolved through any in-root symlinks without
+		// letting the kernel follow them; nil on a test double.
+		let target: (directory: ContainedDirectory, leaf: String)?
+		if let root = try openContainedRoot() {
+			target = try root.openExistingRegularFile(Self.components(relativePath))
+		} else {
+			target = nil
+			guard fm.fileExists(atPath: lexicalAbsolutePath(relativePath), isDirectory: nil) else {
+				throw FileSystemError.fileNotFound
+			}
 		}
+		let fullURL = URL(fileURLWithPath: lexicalAbsolutePath(relativePath))
 		let enc = encodingMap[relativePath] ?? .utf8
 		guard var data = newContent.data(using: enc) else {
 			throw FileSystemError.failedToEditFile(
@@ -5438,7 +5523,11 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		// --- 1. do I/O off-actor ----------------------------------------
 		do {
 			try await Task.detached(priority: .utility) {
-				try FileSystemService.writeFileRobust(to: fullURL, data: payload)
+				if let target {
+					try FileSystemService.writeFileRobust(inDirectory: target.directory, name: target.leaf, data: payload)
+				} else {
+					try FileSystemService.writeFileRobust(to: fullURL, data: payload)
+				}
 			}.value                                    // bubbles error
 		} catch {
 			throw FileSystemError.failedToEditFile(error)
@@ -6491,61 +6580,33 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		return relative
 	}
 
-	/// Resolves a caller-supplied relative path to the absolute path a write
-	/// may touch, or throws `invalidRelativePath`.
+	/// The root opened for one descriptor-relative operation (see
+	/// `ContainedRoot`), or nil when the service runs on a file-system test
+	/// double or on a root that has never existed on disk; those keep the
+	/// path-based code with lexical containment only.
 	///
-	/// Containment is checked lexically (`containedRelativePath`) and then
-	/// physically: the deepest ancestor of the target that already exists is
-	/// resolved with `realpath` and must lie inside the resolved root, so a
-	/// symlinked directory inside the workspace that points elsewhere cannot be
-	/// written through. With `resolvingLeafSymlink`, an existing target that is
-	/// itself a symlink is resolved as well and the resolved path is returned,
-	/// so an edit writes the link's target (when that target is inside the
-	/// root) instead of replacing the link with a regular file.
-	///
-	/// When the root does not exist on disk (test doubles), only the lexical
-	/// check applies. A symlink swapped in between this check and the write is
-	/// not detected.
-	private func containedAbsolutePath(
-		forRelativePath rawRelativePath: String,
-		resolvingLeafSymlink: Bool
-	) throws -> (relative: String, absolute: String) {
-		let relative = try containedRelativePath(rawRelativePath)
-		let absolute = StandardizedPath.join(standardizedRoot: standardizedRootPath, standardizedRelativePath: relative)
-		guard let realRoot = Self.posixRealPath(standardizedRootPath) else {
-			// A root that existed and is gone (moved, deleted, unmounted) must
-			// not be re-created by `createDirectory(withIntermediateDirectories:)`.
+	/// - Throws: `fileNotFound` when the root existed when the service was
+	///   created and is gone now, so a write does not re-create it.
+	private func openContainedRoot() throws -> ContainedRoot? {
+		#if DEBUG
+		if let override = fileManagerOverride, !(override is FileManager) {
+			return nil
+		}
+		#endif
+		do {
+			return try ContainedRoot(path: standardizedRootPath, alternateSpellings: [canonicalRootPath, realRootPath])
+		} catch {
 			if rootExistedAtInit { throw FileSystemError.fileNotFound }
-			return (relative, absolute)
+			return nil
 		}
-		func isInsideRoot(_ resolved: String) -> Bool {
-			StandardizedPath.isDescendant(resolved, of: realRoot)
-		}
+	}
 
-		var leafInfo = stat()
-		let leafExists = lstat(absolute, &leafInfo) == 0
-		if resolvingLeafSymlink, leafExists, (leafInfo.st_mode & S_IFMT) == S_IFLNK {
-			guard let resolvedLeaf = Self.posixRealPath(absolute),
-				resolvedLeaf != realRoot,
-				isInsideRoot(resolvedLeaf) else {
-				throw FileSystemError.invalidRelativePath
-			}
-			return (relative, resolvedLeaf)
-		}
+	private func lexicalAbsolutePath(_ containedRelativePath: String) -> String {
+		StandardizedPath.join(standardizedRoot: standardizedRootPath, standardizedRelativePath: containedRelativePath)
+	}
 
-		// Deepest existing ancestor of the target (the root at the latest).
-		var ancestor = (absolute as NSString).deletingLastPathComponent
-		var ancestorInfo = stat()
-		while lstat(ancestor, &ancestorInfo) != 0 {
-			guard errno == ENOENT, ancestor.count > standardizedRootPath.count else {
-				throw FileSystemError.invalidRelativePath
-			}
-			ancestor = (ancestor as NSString).deletingLastPathComponent
-		}
-		guard let resolvedAncestor = Self.posixRealPath(ancestor), isInsideRoot(resolvedAncestor) else {
-			throw FileSystemError.invalidRelativePath
-		}
-		return (relative, absolute)
+	private static func components(_ containedRelativePath: String) -> [String] {
+		containedRelativePath.split(separator: "/").map(String.init)
 	}
 
 	private enum RelativeEventPath {
@@ -6888,82 +6949,112 @@ public extension FileSystemService {
 		try data.write(to: url, options: .atomic)   // blocking write
 	}
 	
-	/// Writes `data` to `url` without ever leaving an existing destination
-	/// missing, empty or partially written because the write failed.
-	///
-	/// 1. Write a temp file in the destination's directory, carry the
-	///    destination's mode, ACL and extended attributes (Finder tags,
-	///    comments) over to it, and `rename(2)` it into place (atomic).
-	/// 2. If the volume refuses to rename over an existing file, move the
-	///    original aside, move the temp in, then delete the original; if the
-	///    second step fails the original is moved back.
-	/// 3. Only when no temp file can be created because the directory is not
-	///    writable (EACCES/EPERM) while the file is, rewrite the file in place;
-	///    if that write fails the original bytes are written back.
-	///
-	/// Any other failure (disk full, quota, I/O error, read-only volume) is
-	/// thrown with the destination untouched. The destination path is used
-	/// as given; callers resolve symlinks first (a symlink at `url` is
-	/// replaced in steps 1–2 and refused in step 3). Steps 1–2 replace the
-	/// directory entry, so other hard links to the file keep the old bytes;
-	/// step 3 keeps them.
-	static func writeFileRobust(
+	/// Path form of `writeFileRobust(inDirectory:name:data:)`: opens the
+	/// parent directory of `url` (following symlinks in that path) and writes
+	/// the last component relative to it.
+	internal static func writeFileRobust(
 		to url: URL,
 		data: Data
 	) throws {
-		let path = url.path
-		let directory = (path as NSString).deletingLastPathComponent
-		var destinationInfo = stat()
-		let destinationExists = lstat(path, &destinationInfo) == 0
-		let destinationIsRegularFile = destinationExists && (destinationInfo.st_mode & S_IFMT) == S_IFREG
-		// Only a regular file (or a symlink, which is replaced) is ever
-		// swapped out; a directory or special file at the path is refused.
-		if destinationExists, !destinationIsRegularFile, (destinationInfo.st_mode & S_IFMT) != S_IFLNK {
-			throw posixError(EISDIR, "write", path)
+		let parent = url.deletingLastPathComponent().path
+		let fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+		guard fd >= 0 else { throw posixError(errno, "open", parent) }
+		try writeFileRobust(inDirectory: ContainedDirectory(adopting: fd), name: url.lastPathComponent, data: data)
+	}
+
+	/// Writes `data` to the entry `name` of `directory` without ever leaving an
+	/// existing destination missing, empty or partially written because the
+	/// write failed. Every step is relative to `directory`'s descriptor and
+	/// never follows a symlink at `name`, so the bytes land in that directory
+	/// whatever happens to the path meanwhile.
+	///
+	/// 1. Create a temp file in `directory` (`O_CREAT|O_EXCL|O_NOFOLLOW`), carry
+	///    the destination's mode, ACL and extended attributes (Finder tags,
+	///    comments) over, and `renameat` it into place (atomic).
+	/// 2. If the volume refuses to rename over an existing file, move the
+	///    original aside, move the temp in, then delete the original; if the
+	///    second step fails the original is moved back.
+	/// 3. When the destination cannot be replaced by rename (EPERM/EACCES: a
+	///    sticky directory and another user's file) or no temp file can be
+	///    created (a directory that is not writable) while the file itself is
+	///    writable, rewrite the file in place; if that fails the original
+	///    bytes are written back.
+	///
+	/// Any other failure (disk full, quota, I/O error, read-only volume) is
+	/// thrown with the destination untouched and no temp file left behind.
+	/// A symlink at `name` is replaced in steps 1–2 and refused in step 3
+	/// (callers resolve symlinks first); a directory or special file is
+	/// refused. Steps 1–2 replace the directory entry, so other hard links to
+	/// the file keep the old bytes; step 3 keeps them.
+	///
+	/// With `createOnly`, a destination that appears after the caller's
+	/// existence check is not replaced: the rename fails with EEXIST.
+	internal static func writeFileRobust(
+		inDirectory directory: ContainedDirectory,
+		name: String,
+		data: Data,
+		createOnly: Bool = false
+	) throws {
+		let destination = ContainedRoot.entryInfo(name, in: directory)
+		let destinationType = destination.map { $0.st_mode & S_IFMT }
+		let destinationIsRegularFile = destinationType == S_IFREG
+		if let destinationType, destinationType != S_IFREG, destinationType != S_IFLNK {
+			throw posixError(EISDIR, "write", name)
 		}
 
-		let tempPath = (directory as NSString).appendingPathComponent(".repoprompt.tmp.\(UUID().uuidString)")
-		let createError = writeNewFilePOSIX(
-			atPath: tempPath,
+		let tempName = ".repoprompt.tmp.\(UUID().uuidString)"
+		let createError = writeNewFile(
+			named: tempName,
+			in: directory,
 			data: data,
-			mode: destinationIsRegularFile ? mode_t(destinationInfo.st_mode & 0o7777) : nil
+			mode: destinationIsRegularFile ? mode_t(destination!.st_mode & 0o7777) : nil,
+			copyingMetadataFrom: destinationIsRegularFile ? name : nil
 		)
 		if createError == 0 {
-			if destinationIsRegularFile {
-				// Best effort: losing an xattr is not a reason to fail the save.
-				_ = copyfile(path, tempPath, nil, copyfile_flags_t(COPYFILE_XATTR | COPYFILE_ACL))
+			#if DEBUG
+			let simulated = destination != nil ? simulatedReplaceRenameErrorForTesting.load(ordering: .relaxed) : 0
+			#else
+			let simulated: Int32 = 0
+			#endif
+			if createOnly, destination == nil {
+				if renameatx_np(directory.fd, tempName, directory.fd, name, UInt32(RENAME_EXCL)) == 0 { return }
+				let exclusiveError = errno
+				if exclusiveError != ENOTSUP && exclusiveError != EINVAL {
+					unlinkat(directory.fd, tempName, 0)
+					throw posixError(exclusiveError, "rename", name)
+				}
 			}
-			if rename(tempPath, path) == 0 { return }
-			let renameError = errno
-			if destinationExists {
-				let backupPath = (directory as NSString).appendingPathComponent(".repoprompt.tmp.bak.\(UUID().uuidString)")
-				if rename(path, backupPath) == 0 {
-					if rename(tempPath, path) == 0 {
-						unlink(backupPath)
+			if simulated == 0, renameat(directory.fd, tempName, directory.fd, name) == 0 { return }
+			let renameError = simulated != 0 ? simulated : errno
+			if destination != nil {
+				let backupName = ".repoprompt.tmp.bak.\(UUID().uuidString)"
+				if simulated == 0, renameat(directory.fd, name, directory.fd, backupName) == 0 {
+					if renameat(directory.fd, tempName, directory.fd, name) == 0 {
+						unlinkat(directory.fd, backupName, 0)
 						return
 					}
 					let swapError = errno
-					rename(backupPath, path)
-					unlink(tempPath)
-					throw posixError(swapError, "rename", path)
+					renameat(directory.fd, backupName, directory.fd, name)
+					unlinkat(directory.fd, tempName, 0)
+					throw posixError(swapError, "rename", name)
 				}
 			}
-			unlink(tempPath)
-			throw posixError(renameError, "rename", path)
+			unlinkat(directory.fd, tempName, 0)
+			if destinationIsRegularFile, renameError == EPERM || renameError == EACCES {
+				try rewriteFileInPlace(named: name, in: directory, data: data)
+				return
+			}
+			throw posixError(renameError, "rename", name)
 		}
 
 		guard destinationIsRegularFile, createError == EACCES || createError == EPERM else {
-			throw posixError(createError, "write", tempPath)
+			throw posixError(createError, "write", tempName)
 		}
-		try rewriteFileInPlacePOSIX(atPath: path, data: data)
+		try rewriteFileInPlace(named: name, in: directory, data: data)
 	}
 
 	private static func posixError(_ code: Int32, _ operation: String, _ path: String) -> NSError {
-		NSError(
-			domain: NSPOSIXErrorDomain,
-			code: Int(code),
-			userInfo: [NSLocalizedDescriptionKey: "\(operation) failed for \(path) (\(code))"]
-		)
+		ContainedRoot.posixError(code, operation, path)
 	}
 
 	/// Writes every byte of `bytes` to `fd`, retrying on EINTR and short
@@ -6984,11 +7075,18 @@ public extension FileSystemService {
 		return 0
 	}
 
-	/// Creates `path` exclusively (never following or replacing anything that
-	/// is already there) and writes `data` to it. On failure the partial file
-	/// is removed. Returns 0 or the failing errno.
-	private static func writeNewFilePOSIX(atPath path: String, data: Data, mode: mode_t?) -> Int32 {
-		let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+	/// Creates `name` in `directory` exclusively (never following or replacing
+	/// anything already there) and writes `data` to it, copying ACL and
+	/// extended attributes from `metadataSource` when given. On failure the
+	/// partial file is removed. Returns 0 or the failing errno.
+	private static func writeNewFile(
+		named name: String,
+		in directory: ContainedDirectory,
+		data: Data,
+		mode: mode_t?,
+		copyingMetadataFrom metadataSource: String?
+	) -> Int32 {
+		let fd = openat(directory.fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
 		if fd == -1 { return errno }
 		var failure: Int32 = 0
 		if let mode, fchmod(fd, mode) != 0 {
@@ -6997,22 +7095,30 @@ public extension FileSystemService {
 		if failure == 0 {
 			failure = data.withUnsafeBytes { writeAll(fd, $0) }
 		}
+		if failure == 0, let metadataSource {
+			// Best effort: losing an xattr is not a reason to fail the save.
+			let source = openat(directory.fd, metadataSource, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+			if source >= 0 {
+				_ = fcopyfile(source, fd, nil, copyfile_flags_t(COPYFILE_XATTR | COPYFILE_ACL))
+				close(source)
+			}
+		}
 		if close(fd) != 0, failure == 0 {
 			failure = errno
 		}
 		if failure != 0 {
-			unlink(path)
+			unlinkat(directory.fd, name, 0)
 		}
 		return failure
 	}
 
-	/// In-place rewrite for a writable file in a directory where no temp file
-	/// can be created. The original bytes are read first and written back if
-	/// the new write fails, so a failure does not leave the file truncated.
-	private static func rewriteFileInPlacePOSIX(atPath path: String, data: Data) throws {
-		let fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+	/// In-place rewrite for a writable file that cannot be replaced by rename.
+	/// The original bytes are read first and written back if the new write
+	/// fails, so a failure does not leave the file truncated.
+	private static func rewriteFileInPlace(named name: String, in directory: ContainedDirectory, data: Data) throws {
+		let fd = openat(directory.fd, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
 		if fd == -1 {
-			throw posixError(errno, "open", path)
+			throw posixError(errno, "open", name)
 		}
 		defer { close(fd) }
 
@@ -7022,7 +7128,7 @@ public extension FileSystemService {
 			let count = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
 			if count < 0 {
 				if errno == EINTR { continue }
-				throw posixError(errno, "read", path)
+				throw posixError(errno, "read", name)
 			}
 			if count == 0 { break }
 			original.append(contentsOf: chunk[0..<count])
@@ -7040,7 +7146,7 @@ public extension FileSystemService {
 		let failure = replaceContents(with: data)
 		if failure != 0 {
 			_ = replaceContents(with: original)
-			throw posixError(failure, "write", path)
+			throw posixError(failure, "write", name)
 		}
 	}
 }

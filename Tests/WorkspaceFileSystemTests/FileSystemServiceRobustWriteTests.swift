@@ -59,6 +59,22 @@ final class FileSystemServiceRobustWriteTests: XCTestCase {
 		XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "new\n")
 	}
 
+	/// In a sticky directory a file owned by someone else cannot be replaced
+	/// by rename (EPERM) even when the file itself is writable; it must still
+	/// be saved, in place. Rename refusal is simulated (making another user's
+	/// file needs root).
+	func testFileThatCannotBeReplacedByRenameIsRewrittenInPlace() throws {
+		let url = dirURL.appendingPathComponent("shared.txt")
+		try Data("old contents\n".utf8).write(to: url)
+		FileSystemService.simulatedReplaceRenameErrorForTesting.store(EPERM, ordering: .relaxed)
+		defer { FileSystemService.simulatedReplaceRenameErrorForTesting.store(0, ordering: .relaxed) }
+
+		try FileSystemService.writeFileRobust(to: url, data: Data("new\n".utf8))
+
+		XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "new\n")
+		XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dirURL.path), ["shared.txt"], "temp or backup files left behind")
+	}
+
 	func testWriteKeepsModeAndExtendedAttributes() throws {
 		let url = dirURL.appendingPathComponent("script.sh")
 		try Data("#!/bin/sh\necho old\n".utf8).write(to: url)
