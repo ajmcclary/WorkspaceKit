@@ -5787,15 +5787,15 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 
 	// MARK: - Binary detection helpers
 	// ─────────────────────────────────────────────────────────────────────────────
+	/// Bytes the binary probe looks at (also what the typed read reads before
+	/// deciding a file is not text).
+	private static let binaryProbeLength = 8_192
+
 	/// Binary detection heuristic (Git-style, UTF-8 tolerant)
 	///
 	/// • Any NUL byte → binary
 	/// • Control bytes 0x00–0x1F **except** TAB/LF/CR
 	/// • If ≥ 30 % of the bytes in the sample are control bytes → binary
-	/// Bytes the binary probe looks at (also what the typed read reads before
-	/// deciding a file is not text).
-	private static let binaryProbeLength = 8_192
-
 	private static func isProbablyBinary(_ data: Data, sampleSize: Int = 8_192) -> Bool {
 		guard !data.isEmpty else { return false }
 		let sample = data.prefix(sampleSize)
