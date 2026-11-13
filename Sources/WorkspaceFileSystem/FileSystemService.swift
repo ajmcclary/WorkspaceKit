@@ -755,6 +755,14 @@ public actor FileSystemService {
 	/// Test-only tracking of processed events
 	private var processedFolders: Set<String> = []
 
+	/// Test-only: awaited by `reconcileSubtree` right after its walk, to
+	/// interleave work that runs while the walk is suspended.
+	private var reconcileWalkFinishedHookForTesting: (@Sendable () async -> Void)?
+
+	public func setReconcileWalkFinishedHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+		reconcileWalkFinishedHookForTesting = hook
+	}
+
 	/// Test-only: a non-zero errno makes every rename that would replace (or
 	/// move aside) an existing destination fail with it, as in a sticky
 	/// directory where the file belongs to another user.
@@ -4103,6 +4111,11 @@ public actor FileSystemService {
 			skipSymlinks: skipSymlinks,
 			baseRelativePath: folderRelPath
 		)
+		#if DEBUG
+		if let hook = reconcileWalkFinishedHookForTesting {
+			await hook()
+		}
+		#endif
 		var actual: [String: Bool] = [:]
 		actual.reserveCapacity(found.count)
 		for (subRelPath, isDir) in found {
@@ -4114,6 +4127,10 @@ public actor FileSystemService {
 		var deltas: [FileSystemDelta] = []
 		for path in actual.keys.filter({ !tracked.contains($0) }).sorted(by: { $0.count < $1.count }) {
 			if isIgnoreFile(path) { continue }
+			// The walk awaited per directory: a delete (or a remove event) that
+			// ran on the actor meanwhile already untracked this path. Only add
+			// what is still on disk now.
+			if !fm.fileExists(atPath: getFullPath(forRelativePath: path), isDirectory: nil) { continue }
 			let isDir = actual[path] ?? false
 			visitedPaths.insert(path)
 			visitedItems[path] = isDir

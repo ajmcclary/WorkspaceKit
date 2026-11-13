@@ -134,6 +134,26 @@ final class FileSystemServiceWatcherRecoveryTests: XCTestCase {
 		XCTAssertTrue(deltas.contains(.fileAdded("pkg/src/deeper/c.swift")), "\(deltas)")
 	}
 
+	func testReconcileDoesNotReAddAFileDeletedWhileItsWalkWasSuspended() async throws {
+		try touch("a/doomed.txt")
+		try touch("a/keep.txt")
+		let service = try await FileSystemService(path: rootURL.path, respectGitignore: false, respectRepoIgnore: false, respectCursorignore: false)
+		try await walk(service)
+		try touch("a/new.txt")
+		await service.setReconcileWalkFinishedHookForTesting {
+			_ = try? await service.deleteFile(atRelativePath: "a/doomed.txt")
+		}
+
+		let deltas = await service.simulateFSEvents([
+			(absolutePath: rootURL.path, flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs), eventId: 800)
+		])
+
+		XCTAssertTrue(deltas.contains(.fileAdded("a/new.txt")), "\(deltas)")
+		XCTAssertFalse(deltas.contains(.fileAdded("a/doomed.txt")), "re-added a deleted file: \(deltas)")
+		let paths = await visited(service)
+		XCTAssertFalse(paths.contains("a/doomed.txt"))
+	}
+
 	// MARK: - Initial walk gap
 
 	func testChangeBetweenTheInitialWalkAndTheStreamStartIsReported() async throws {
