@@ -71,62 +71,49 @@ final class ContainedRoot: @unchecked Sendable {
 
 	private static let maxSymlinkHops = 32
 
-	// MARK: - Position arithmetic
+	// MARK: - Link targets
 
-	/// Lexically folds an absolute path; nil if it climbs above `/`.
-	private static func foldedAbsoluteComponents(_ path: String) -> [String]? {
-		var result: [String] = []
-		for component in path.split(separator: "/", omittingEmptySubsequences: true) {
-			switch component {
-			case ".": continue
-			case "..":
-				guard !result.isEmpty else { return nil }
-				result.removeLast()
-			default: result.append(String(component))
-			}
-		}
-		return result
+	/// A symlink's target, ready to be walked. `.` and `..` are kept: the walk
+	/// applies each `..` to the directory it actually reached, the way the
+	/// kernel does, so a target such as `la/../x` (with `la` itself a link)
+	/// lands where every reader of the link lands. Folding the string first
+	/// would not.
+	private enum LinkTarget {
+		/// Components to walk from the directory that holds the link.
+		case relative([String])
+		/// Components to walk from the root.
+		case fromRoot([String])
 	}
 
-	/// Root-relative components of an absolute path, or nil when it is not
-	/// inside the root. Spellings of the root are matched lexically first;
-	/// otherwise `realpath` reports where the path lands now. That answer
-	/// is only a position to walk to: the walk from the root descriptor
-	/// re-checks every component with `O_NOFOLLOW`.
-	private func rootRelativeComponents(ofAbsolute path: String) -> [String]? {
-		guard let folded = Self.foldedAbsoluteComponents(path) else { return nil }
-		let joined = "/" + folded.joined(separator: "/")
-		for spelling in spellings {
-			let base = spelling.count > 1 && spelling.hasSuffix("/") ? String(spelling.dropLast()) : spelling
-			if joined == base { return [] }
-			if joined.hasPrefix(base + "/") {
-				return joined.dropFirst(base.count + 1).split(separator: "/").map(String.init)
-			}
-		}
-		guard let resolved = joined.withCString({ cPath -> String? in
-			guard let pointer = realpath(cPath, nil) else { return nil }
-			defer { free(pointer) }
-			return String(cString: pointer)
-		}) else { return nil }
-		if resolved == realPath { return [] }
-		guard resolved.hasPrefix(realPath + "/") else { return nil }
-		return resolved.dropFirst(realPath.count + 1).split(separator: "/").map(String.init)
-	}
-
-	/// Where the symlink `name` inside the directory at root-relative `position`
-	/// points, as root-relative components; nil when outside the root.
-	private func resolveLink(named name: String, in directory: ContainedDirectory, position: [String]) -> [String]? {
+	/// Reads the symlink `name` in `directory`. An absolute target is mapped to
+	/// the root by matching one of the root's spellings component by
+	/// component (the rest, `..` included, is walked); otherwise `realpath`
+	/// reports where the kernel resolves it now. That answer is only a
+	/// position to walk to: the walk from the root descriptor re-checks every
+	/// component with `O_NOFOLLOW`. nil when the target is not inside the root.
+	private func readLink(named name: String, in directory: ContainedDirectory) -> LinkTarget? {
 		var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) + 1)
 		let length = readlinkat(directory.fd, name, &buffer, Int(MAXPATHLEN))
 		guard length > 0 else { return nil }
 		let target = String(decoding: buffer.prefix(length).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-		if target.hasPrefix("/") {
-			return rootRelativeComponents(ofAbsolute: target)
+		let components = target.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+		guard target.hasPrefix("/") else {
+			return .relative(components)
 		}
-		// `position` is a symlink-free chain from the root, so folding `..`
-		// lexically on realPath + position + target equals the physical walk.
-		let absolute = ([realPath] + position + [target]).joined(separator: "/")
-		return rootRelativeComponents(ofAbsolute: absolute)
+		for spelling in spellings {
+			let base = spelling.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+			if components.count >= base.count, Array(components.prefix(base.count)) == base {
+				return .fromRoot(Array(components.dropFirst(base.count)))
+			}
+		}
+		guard let resolved = target.withCString({ cPath -> String? in
+			guard let pointer = realpath(cPath, nil) else { return nil }
+			defer { free(pointer) }
+			return String(cString: pointer)
+		}) else { return nil }
+		if resolved == realPath { return .fromRoot([]) }
+		guard resolved.hasPrefix(realPath + "/") else { return nil }
+		return .fromRoot(resolved.dropFirst(realPath.count + 1).split(separator: "/").map(String.init))
 	}
 
 	// MARK: - Walking
@@ -135,26 +122,52 @@ final class ContainedRoot: @unchecked Sendable {
 	/// kernel follow any symlink. Returns the descriptor and its resolved,
 	/// symlink-free position.
 	///
+	/// `components` may contain `.` and `..` (from link targets): `..` steps
+	/// back to the directory actually reached before it, and a `..` at the root
+	/// is refused, as is anything else that would leave the root.
+	///
 	/// - Throws: `invalidRelativePath` when a symlink resolves outside the root,
-	///   a component is not a directory, or links loop; `fileNotFound` when a
-	///   component is missing and `createMissing` is false.
+	///   the walk would climb above the root, a component is not a directory,
+	///   or links loop; `fileNotFound` when a component is missing and
+	///   `createMissing` is false.
 	func openDirectory(
 		_ components: [String],
 		createMissing: Bool
 	) throws -> (directory: ContainedDirectory, position: [String]) {
+		var hops = 0
+		return try openDirectory(components, createMissing: createMissing, hops: &hops)
+	}
+
+	private func openDirectory(
+		_ components: [String],
+		createMissing: Bool,
+		hops: inout Int
+	) throws -> (directory: ContainedDirectory, position: [String]) {
 		var pending = components[...]
 		var position: [String] = []
-		var current = directory
-		var hops = 0
+		// Directories reached below the root, parallel to `position`.
+		var reached: [ContainedDirectory] = []
 		var attempts = 0
 		while let component = pending.first {
 			attempts += 1
 			if attempts > 4 * (components.count + Self.maxSymlinkHops) + 64 {
 				throw FileSystemError.invalidRelativePath
 			}
+			if component == "." {
+				pending = pending.dropFirst()
+				continue
+			}
+			if component == ".." {
+				guard !position.isEmpty else { throw FileSystemError.invalidRelativePath }
+				position.removeLast()
+				reached.removeLast()
+				pending = pending.dropFirst()
+				continue
+			}
+			let current = reached.last ?? directory
 			let next = openat(current.fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
 			if next >= 0 {
-				current = ContainedDirectory(adopting: next)
+				reached.append(ContainedDirectory(adopting: next))
 				position.append(component)
 				pending = pending.dropFirst()
 				continue
@@ -172,13 +185,18 @@ final class ContainedRoot: @unchecked Sendable {
 			switch info.st_mode & S_IFMT {
 			case S_IFLNK:
 				hops += 1
-				guard hops <= Self.maxSymlinkHops,
-					let target = resolveLink(named: component, in: current, position: position) else {
+				guard hops <= Self.maxSymlinkHops, let target = readLink(named: component, in: current) else {
 					throw FileSystemError.invalidRelativePath
 				}
-				pending = (target + pending.dropFirst())[...]
-				position = []
-				current = directory
+				switch target {
+				case .relative(let targetComponents):
+					// Walked from the link's own directory (the current position).
+					pending = (targetComponents + pending.dropFirst())[...]
+				case .fromRoot(let targetComponents):
+					pending = (targetComponents + pending.dropFirst())[...]
+					position = []
+					reached = []
+				}
 			case S_IFDIR:
 				// A directory we may not open (permissions), or one that was
 				// swapped in after the open failed: retry once, then report.
@@ -190,7 +208,7 @@ final class ContainedRoot: @unchecked Sendable {
 				throw FileSystemError.invalidRelativePath // not a directory
 			}
 		}
-		return (current, position)
+		return (reached.last ?? directory, position)
 	}
 
 	/// The parent directory of `components` plus the leaf name.
@@ -198,17 +216,33 @@ final class ContainedRoot: @unchecked Sendable {
 		of components: [String],
 		createMissing: Bool
 	) throws -> (directory: ContainedDirectory, position: [String], leaf: String) {
-		guard let leaf = components.last else { throw FileSystemError.invalidRelativePath }
-		let (directory, position) = try openDirectory(Array(components.dropLast()), createMissing: createMissing)
+		var hops = 0
+		return try openParent(of: components, createMissing: createMissing, hops: &hops)
+	}
+
+	private func openParent(
+		of components: [String],
+		createMissing: Bool,
+		hops: inout Int
+	) throws -> (directory: ContainedDirectory, position: [String], leaf: String) {
+		guard let leaf = components.last, leaf != ".", leaf != ".." else { throw FileSystemError.invalidRelativePath }
+		let (directory, position) = try openDirectory(Array(components.dropLast()), createMissing: createMissing, hops: &hops)
 		return (directory, position, leaf)
 	}
 
 	/// The location of an existing regular file, following symlinks at the
-	/// leaf explicitly (each target re-validated against the root).
+	/// leaf explicitly: each target is walked from the link's directory (or
+	/// the root), sharing one hop budget with the directory walks.
 	func openExistingRegularFile(_ components: [String]) throws -> (directory: ContainedDirectory, leaf: String) {
 		var target = components
-		for _ in 0...Self.maxSymlinkHops {
-			let (directory, position, leaf) = try openParent(of: target, createMissing: false)
+		var hops = 0
+		while true {
+			if let last = target.last, last == "." || last == ".." {
+				// The link points at a directory (or out of the root).
+				_ = try openDirectory(target, createMissing: false, hops: &hops)
+				throw FileSystemError.isDirectory
+			}
+			let (directory, position, leaf) = try openParent(of: target, createMissing: false, hops: &hops)
 			var info = stat()
 			guard fstatat(directory.fd, leaf, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
 				throw FileSystemError.fileNotFound
@@ -217,17 +251,21 @@ final class ContainedRoot: @unchecked Sendable {
 			case S_IFREG:
 				return (directory, leaf)
 			case S_IFLNK:
-				guard let resolved = resolveLink(named: leaf, in: directory, position: position), !resolved.isEmpty else {
+				hops += 1
+				guard hops <= Self.maxSymlinkHops, let link = readLink(named: leaf, in: directory) else {
 					throw FileSystemError.invalidRelativePath
 				}
-				target = resolved
+				switch link {
+				case .relative(let targetComponents): target = position + targetComponents
+				case .fromRoot(let targetComponents): target = targetComponents
+				}
+				guard !target.isEmpty else { throw FileSystemError.isDirectory } // the root itself
 			case S_IFDIR:
 				throw FileSystemError.isDirectory
 			default:
 				throw FileSystemError.invalidRelativePath
 			}
 		}
-		throw FileSystemError.invalidRelativePath
 	}
 
 	// MARK: - Entry queries

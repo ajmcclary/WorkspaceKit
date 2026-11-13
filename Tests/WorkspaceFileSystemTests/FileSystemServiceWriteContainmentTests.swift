@@ -95,20 +95,68 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("src/up").path, withDestinationPath: "../lib")
 		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("abs").path, withDestinationPath: rootURL.appendingPathComponent("lib").path)
 		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("chain").path, withDestinationPath: "src/up/deep")
-		// Climbs above the root and comes back in by the root's own name.
+		// Climbs above the root and comes back in by the root's own name: the
+		// walk applies `..` physically and refuses to leave the root, even
+		// for a step.
 		try fm.createSymbolicLink(atPath: rootURL.appendingPathComponent("around").path, withDestinationPath: "../app/lib")
 		let service = try await makeService()
 
 		try await service.createFile(atRelativePath: "src/up/a.txt", content: "a")
 		try await service.createFile(atRelativePath: "abs/b.txt", content: "b")
 		try await service.createFile(atRelativePath: "chain/c.txt", content: "c")
-		try await service.createFile(atRelativePath: "around/d.txt", content: "d")
+		await assertInvalidRelativePath({ try await service.createFile(atRelativePath: "around/d.txt", content: "d") }, "around/d.txt")
 		try await service.editFile(atRelativePath: "chain/c.txt", newContent: "c2")
 
 		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/a.txt"), encoding: .utf8), "a")
 		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/b.txt"), encoding: .utf8), "b")
 		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/deep/c.txt"), encoding: .utf8), "c2")
-		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("lib/d.txt"), encoding: .utf8), "d")
+		XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.appendingPathComponent("lib/d.txt").path))
+	}
+
+	/// `div -> la/../divtarget.txt` with `la` a link to outside: the kernel
+	/// applies `..` to the directory `la` really points at, so `div` is a file
+	/// outside the root. Folding the string instead would edit the unrelated
+	/// `root/divtarget.txt`.
+	func testLinkTargetWithParentStepAfterALinkedDirectoryIsResolvedPhysically() async throws {
+		try FileManager.default.createSymbolicLink(at: rootURL.appendingPathComponent("la"), withDestinationURL: outsideURL)
+		let physicalTarget = sandboxURL.appendingPathComponent("divtarget.txt")
+		try "outside-div".write(to: physicalTarget, atomically: true, encoding: .utf8)
+		let decoy = rootURL.appendingPathComponent("divtarget.txt")
+		try "inside".write(to: decoy, atomically: true, encoding: .utf8)
+		try FileManager.default.createSymbolicLink(atPath: rootURL.appendingPathComponent("div").path, withDestinationPath: "la/../divtarget.txt")
+		try FileManager.default.createSymbolicLink(atPath: rootURL.appendingPathComponent("divdir").path, withDestinationPath: "la/..")
+		let service = try await makeService()
+
+		await assertInvalidRelativePath({ try await service.editFile(atRelativePath: "div", newContent: "EDITED") }, "edit div")
+		await assertInvalidRelativePath({ try await service.createFile(atRelativePath: "divdir/new.txt", content: "x") }, "create divdir/new.txt")
+
+		XCTAssertEqual(try String(contentsOf: decoy, encoding: .utf8), "inside", "edited a file nobody reads through the link")
+		XCTAssertEqual(try String(contentsOf: physicalTarget, encoding: .utf8), "outside-div")
+		XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.appendingPathComponent("new.txt").path))
+	}
+
+	/// The mirror case: the physical target is inside the root, and it is the
+	/// one that must be edited (not the lexically folded decoy).
+	func testLinkTargetWithParentStepAfterAnInRootLinkedDirectoryEditsTheRealTarget() async throws {
+		let deep = rootURL.appendingPathComponent("src/deep", isDirectory: true)
+		try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+		try FileManager.default.createSymbolicLink(at: rootURL.appendingPathComponent("la2"), withDestinationURL: deep)
+		let realTarget = rootURL.appendingPathComponent("src/target.txt")
+		try "real".write(to: realTarget, atomically: true, encoding: .utf8)
+		let decoy = rootURL.appendingPathComponent("target.txt")
+		try "decoy".write(to: decoy, atomically: true, encoding: .utf8)
+		try FileManager.default.createSymbolicLink(atPath: rootURL.appendingPathComponent("div2").path, withDestinationPath: "la2/../target.txt")
+		try FileManager.default.createSymbolicLink(atPath: rootURL.appendingPathComponent("divdir2").path, withDestinationPath: "la2/..")
+		let service = try await makeService()
+
+		let read = try await service.loadContent(ofRelativePath: "div2")
+		XCTAssertEqual(read, "real")
+		try await service.editFile(atRelativePath: "div2", newContent: "EDITED")
+		try await service.createFile(atRelativePath: "divdir2/created.txt", content: "c")
+
+		XCTAssertEqual(try String(contentsOf: realTarget, encoding: .utf8), "EDITED")
+		XCTAssertEqual(try String(contentsOf: decoy, encoding: .utf8), "decoy")
+		XCTAssertEqual(try String(contentsOf: rootURL.appendingPathComponent("src/created.txt"), encoding: .utf8), "c")
 	}
 
 	func testRootThatIsItselfASymlinkStillAcceptsWrites() async throws {
