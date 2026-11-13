@@ -181,6 +181,12 @@ int repo_levenshtein_distance(const char *a, const char *b, int maxDist) {
 
 /* MARK: - Dice Coefficient */
 
+static int compare_bigram_keys(const void *lhs, const void *rhs) {
+    uint16_t a = *(const uint16_t *)lhs;
+    uint16_t b = *(const uint16_t *)rhs;
+    return (a > b) - (a < b);
+}
+
 /**
  * Sørensen–Dice coefficient on character bigrams
  * Returns value between 0.0 and 1.0
@@ -197,50 +203,52 @@ double repo_dice_coefficient(const char *a, const char *b) {
         return (a[0] == b[0]) ? 1.0 : 0.0;
     }
     
-    /* Count bigrams using a simple hash table */
-    /* We'll use a 16-bit hash for bigrams (8 bits per char) */
-    #define BIGRAM_TABLE_SIZE 65536
-    int *bigrams_a = calloc(BIGRAM_TABLE_SIZE, sizeof(int));
-    int *bigrams_b = calloc(BIGRAM_TABLE_SIZE, sizeof(int));
-    
-    if (!bigrams_a || !bigrams_b) {
-        free(bigrams_a);
-        free(bigrams_b);
-        return 0.0;
+    /* Multiset intersection of the two strings' (ASCII case-folded) bigrams.
+     * Sorting the bigram keys and merging keeps the cost proportional to the
+     * input; the former version zero-allocated and scanned two 65,536-entry
+     * tables (512 KB) on every call. Short inputs use the stack. */
+    size_t count_a = len_a - 1;
+    size_t count_b = len_b - 1;
+    uint16_t stack_keys[512];
+    uint16_t *keys_a = stack_keys;
+    uint16_t *keys_b = stack_keys + 256;
+    uint16_t *heap_keys = NULL;
+    if (count_a > 256 || count_b > 256) {
+        heap_keys = malloc((count_a + count_b) * sizeof(uint16_t));
+        if (!heap_keys) return 0.0;
+        keys_a = heap_keys;
+        keys_b = heap_keys + count_a;
     }
-    
-    /* Convert to lowercase and count bigrams for string a */
-    for (size_t i = 0; i < len_a - 1; i++) {
+
+    for (size_t i = 0; i < count_a; i++) {
         unsigned char c1 = tolower((unsigned char)a[i]);
         unsigned char c2 = tolower((unsigned char)a[i + 1]);
-        uint16_t key = ((uint16_t)c1 << 8) | c2;
-        bigrams_a[key]++;
+        keys_a[i] = (uint16_t)(((uint16_t)c1 << 8) | c2);
     }
-    
-    /* Count bigrams for string b */
-    for (size_t i = 0; i < len_b - 1; i++) {
+    for (size_t i = 0; i < count_b; i++) {
         unsigned char c1 = tolower((unsigned char)b[i]);
         unsigned char c2 = tolower((unsigned char)b[i + 1]);
-        uint16_t key = ((uint16_t)c1 << 8) | c2;
-        bigrams_b[key]++;
+        keys_b[i] = (uint16_t)(((uint16_t)c1 << 8) | c2);
     }
-    
-    /* Compute intersection size */
-    int intersection = 0;
-    for (int i = 0; i < BIGRAM_TABLE_SIZE; i++) {
-        if (bigrams_a[i] > 0 && bigrams_b[i] > 0) {
-            intersection += (bigrams_a[i] < bigrams_b[i]) ? bigrams_a[i] : bigrams_b[i];
+    qsort(keys_a, count_a, sizeof(uint16_t), compare_bigram_keys);
+    qsort(keys_b, count_b, sizeof(uint16_t), compare_bigram_keys);
+
+    size_t intersection = 0;
+    size_t ia = 0, ib = 0;
+    while (ia < count_a && ib < count_b) {
+        if (keys_a[ia] == keys_b[ib]) {
+            intersection++;
+            ia++;
+            ib++;
+        } else if (keys_a[ia] < keys_b[ib]) {
+            ia++;
+        } else {
+            ib++;
         }
     }
-    
-    free(bigrams_a);
-    free(bigrams_b);
-    
-    /* Total bigrams */
-    int total_a = (int)(len_a - 1);
-    int total_b = (int)(len_b - 1);
-    
-    return (2.0 * intersection) / (double)(total_a + total_b);
+    free(heap_keys);
+
+    return (2.0 * (double)intersection) / (double)(count_a + count_b);
 }
 
 /* MARK: - Longest Common Subsequence */
