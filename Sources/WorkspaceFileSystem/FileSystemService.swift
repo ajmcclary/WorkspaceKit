@@ -755,6 +755,13 @@ public actor FileSystemService {
 	/// Test-only tracking of processed events
 	private var processedFolders: Set<String> = []
 
+	/// Test-only: bytes `readFileContent` has read from disk since creation.
+	private var typedReadBytesRead = 0
+
+	public func typedReadBytesReadForTesting() -> Int {
+		typedReadBytesRead
+	}
+
 	/// Test-only: awaited by `reconcileSubtree` right after its walk, to
 	/// interleave work that runs while the walk is suspended.
 	private var reconcileWalkFinishedHookForTesting: (@Sendable () async -> Void)?
@@ -5100,21 +5107,43 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		defer { try? handle.close() }
 		var data = Data()
 		data.reserveCapacity(Int(fileSize))
-		while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+
+		// Read the probe prefix first and classify from it alone: the binary
+		// probe and the byte-order-mark check only ever look at the first
+		// 8 KB, so a binary file costs 8 KB, not the whole file. A file that
+		// passes is read on from the same handle, so text is read once.
+		func readChunk(upTo count: Int) throws -> Data? {
+			guard let chunk = try handle.read(upToCount: count), !chunk.isEmpty else { return nil }
+			#if DEBUG
+			typedReadBytesRead += chunk.count
+			#endif
+			return chunk
+		}
+		while data.count < Self.binaryProbeLength, let chunk = try readChunk(upTo: Self.binaryProbeLength - data.count) {
 			data.append(chunk)
-			if Int64(data.count) > limit {
-				// The file grew past the limit while it was being read.
-				return .tooLarge(byteCount: Int64(data.count), limit: limit)
-			}
-			try Task.checkCancellation()
+		}
+		if Int64(data.count) > limit {
+			// The file grew past the limit after its size was checked.
+			return .tooLarge(byteCount: Int64(data.count), limit: limit)
 		}
 
 		let byteOrderMarkEncoding = Self.detectBOMEncoding(in: data)
 		let skipProbe = byteOrderMarkEncoding != nil
 			|| Self.alwaysTextExtensions.contains(ext)
 			|| (ext.isEmpty && Self.alwaysTextFilenames.contains(url.lastPathComponent.lowercased()))
-		if !skipProbe && Self.isProbablyBinary(data) {
+		if !skipProbe && Self.isProbablyBinary(data, sampleSize: Self.binaryProbeLength) {
 			return .binary
+		}
+
+		if data.count == Self.binaryProbeLength {
+			while let chunk = try readChunk(upTo: 1_048_576) {
+				data.append(chunk)
+				if Int64(data.count) > limit {
+					// The file grew past the limit while it was being read.
+					return .tooLarge(byteCount: Int64(data.count), limit: limit)
+				}
+				try Task.checkCancellation()
+			}
 		}
 
 		let result = decodeText(data, byteOrderMarkEncoding: byteOrderMarkEncoding)
@@ -5763,6 +5792,10 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	/// • Any NUL byte → binary
 	/// • Control bytes 0x00–0x1F **except** TAB/LF/CR
 	/// • If ≥ 30 % of the bytes in the sample are control bytes → binary
+	/// Bytes the binary probe looks at (also what the typed read reads before
+	/// deciding a file is not text).
+	private static let binaryProbeLength = 8_192
+
 	private static func isProbablyBinary(_ data: Data, sampleSize: Int = 8_192) -> Bool {
 		guard !data.isEmpty else { return false }
 		let sample = data.prefix(sampleSize)
