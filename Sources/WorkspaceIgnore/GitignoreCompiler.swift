@@ -868,7 +868,7 @@ public final class GitignoreCompiler {
 					}
 					
 					let anchoredToIgnoreFileDirectory = parsedPattern.absolute || patternStr.contains("/")
-					let prefix = directoryPath.hasSuffix("/") ? String(directoryPath.dropLast()) : directoryPath
+					let prefix = escapedGlobLiteral(directoryPath.hasSuffix("/") ? String(directoryPath.dropLast()) : directoryPath)
 					var adjustedPattern = patternStr
 					var absolute = anchoredToIgnoreFileDirectory
 					var prefilter = makePrefilter(
@@ -942,6 +942,21 @@ public final class GitignoreCompiler {
 	}
 
 	private static let maxTraversalVariants = 32
+
+	/// A directory path as a literal glob prefix: `\`, `*`, `?` and `[` in a
+	/// directory name are escaped so they match only themselves.
+	private static func escapedGlobLiteral(_ path: String) -> String {
+		guard path.contains(where: { $0 == "\\" || $0 == "*" || $0 == "?" || $0 == "[" }) else { return path }
+		var escaped = ""
+		escaped.reserveCapacity(path.count + 4)
+		for character in path {
+			if character == "\\" || character == "*" || character == "?" || character == "[" {
+				escaped.append("\\")
+			}
+			escaped.append(character)
+		}
+		return escaped
+	}
 
 	private static func makePrefilter(
 		pattern: String,

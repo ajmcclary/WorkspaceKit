@@ -49,6 +49,18 @@ final class NestedIgnoreFileScopeTests: XCTestCase {
 		XCTAssertFalse(nested.isIgnored(relativePath: "a.log", isDirectory: false))
 	}
 
+	func testGlobCharactersInTheIgnoreFileDirectoryAreLiteral() {
+		let nested = rules(nestedAt: "pkg[1]", content: "*.log\n/build\n")
+		XCTAssertTrue(nested.isIgnored(relativePath: "pkg[1]/a.log", isDirectory: false))
+		XCTAssertTrue(nested.isIgnored(relativePath: "pkg[1]/build", isDirectory: true))
+		XCTAssertFalse(nested.isIgnored(relativePath: "pkg1/a.log", isDirectory: false), "[1] in the directory name is not a glob")
+		XCTAssertFalse(nested.isIgnored(relativePath: "pkg1/build", isDirectory: true))
+
+		let starred = rules(nestedAt: "a*b", content: "*.tmp\n")
+		XCTAssertTrue(starred.isIgnored(relativePath: "a*b/x.tmp", isDirectory: false))
+		XCTAssertFalse(starred.isIgnored(relativePath: "aXb/x.tmp", isDirectory: false))
+	}
+
 	func testRootIgnoreFileIsUnchanged() {
 		let root = rules(nestedAt: "", content: "lib/\n*.log\n")
 		XCTAssertTrue(root.isIgnored(relativePath: "lib/x.py", isDirectory: false))
