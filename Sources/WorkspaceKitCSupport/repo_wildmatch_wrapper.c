@@ -42,7 +42,8 @@ static bool has_globstar(const char *pattern)
 
 static unsigned int gitignore_flags_for_pattern(const char *pattern)
 {
-    unsigned int flags = WM_PATHNAME | WM_NOESCAPE;
+    /* Backslash escapes the next character, as in Git (no WM_NOESCAPE). */
+    unsigned int flags = WM_PATHNAME;
     if (has_globstar(pattern)) {
         flags |= WM_WILDSTAR;
     }
@@ -243,8 +244,8 @@ bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result)
     result->directory_only = false;
     result->absolute = false;
     
-    /* Skip leading whitespace */
-    while (*p == ' ' || *p == '\t') p++;
+    /* Git keeps leading whitespace: it is part of the pattern, and a line
+     * that starts with whitespace is not a comment. */
     
     /* Empty line or comment */
     if (*p == '\0' || *p == '#') {
@@ -268,9 +269,13 @@ bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result)
         p++;
     }
     
-    /* Copy pattern, removing trailing whitespace */
-    strncpy(temp, p, sizeof(temp) - 1);
-    temp[sizeof(temp) - 1] = '\0';
+    /* Copy pattern, removing trailing whitespace. A line too long for the
+     * buffer is skipped: truncating it would yield a different pattern. */
+    len = strlen(p);
+    if (len >= sizeof(temp)) {
+        return false;
+    }
+    memcpy(temp, p, len + 1);
     
     /* Trim trailing whitespace, preserving escaped trailing spaces/tabs. */
     trim_trailing_whitespace_preserving_escapes(temp);
