@@ -152,6 +152,34 @@ final class FileSystemServiceWatcherRecoveryTests: XCTestCase {
 		XCTAssertTrue(seen, "a file created before the stream started was never reported")
 	}
 
+	// MARK: - Stop
+
+	func testStreamPayloadArrivingAfterStopIsDropped() async throws {
+		let service = try await FileSystemService(path: rootURL.path, respectGitignore: false, respectRepoIgnore: false, respectCursorignore: false)
+		await service.startWatchingForChanges()
+		await service.stopWatchingForChanges()
+
+		await service.ingestStreamPayloadForTesting([
+			(absolutePath: path("late.txt"), flags: Self.fileCreated, eventId: 900)
+		])
+
+		let state = await service.watcherStateForTesting()
+		XCTAssertEqual(state.pendingRawEventCount, 0, "a callback that fired before stop re-armed the watcher")
+	}
+
+	// MARK: - Missing root
+
+	func testWritesDoNotRecreateARootThatWasRemoved() async throws {
+		let service = try await FileSystemService(path: rootURL.path, respectGitignore: false, respectRepoIgnore: false, respectCursorignore: false)
+		try FileManager.default.removeItem(at: rootURL)
+
+		do {
+			try await service.createFile(atRelativePath: "a/new.txt", content: "x")
+			XCTFail("expected the create to fail")
+		} catch {}
+		XCTAssertFalse(FileManager.default.fileExists(atPath: rootURL.path), "the old root path was re-created")
+	}
+
 	// MARK: - Temp-save names
 
 	func testDotfilesContainingSwAreNotEditorTempFiles() {

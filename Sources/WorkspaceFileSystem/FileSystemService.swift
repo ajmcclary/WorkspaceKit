@@ -487,6 +487,12 @@ public actor FileSystemService {
 	/// the stream starts from it so changes during and after the walk are
 	/// replayed instead of lost.
 	private var streamStartEventId: FSEventStreamEventId?
+	/// Bumped when the stream stops, so a coalescing pass that was already
+	/// running does not publish after stop.
+	private var ingressEpoch: UInt64 = 0
+	/// The root existed when the service was created. A root that has since
+	/// disappeared is not re-created by a write.
+	private let rootExistedAtInit: Bool
 
 
 	/// Short-lived cache
@@ -546,7 +552,9 @@ public actor FileSystemService {
 		self.path = path
 		self.rootURL = URL(fileURLWithPath: path).standardizedFileURL
 		self.canonicalRootURL = rootURL.resolvingSymlinksInPath()
-		self.realRootPath = Self.posixRealPath(rootURL.path) ?? canonicalRootURL.path
+		let initialRealRoot = Self.posixRealPath(rootURL.path)
+		self.realRootPath = initialRealRoot ?? canonicalRootURL.path
+		self.rootExistedAtInit = initialRealRoot != nil
 		self.respectGitignore = respectGitignore
 		self.respectRepoIgnore = respectRepoIgnore
 		self.respectCursorignore = respectCursorignore
@@ -691,7 +699,9 @@ public actor FileSystemService {
 		self.path = path
 		self.rootURL = URL(fileURLWithPath: path).standardizedFileURL
 		self.canonicalRootURL = rootURL.resolvingSymlinksInPath()
-		self.realRootPath = Self.posixRealPath(rootURL.path) ?? canonicalRootURL.path
+		let initialRealRoot = Self.posixRealPath(rootURL.path)
+		self.realRootPath = initialRealRoot ?? canonicalRootURL.path
+		self.rootExistedAtInit = initialRealRoot != nil
 		self.respectGitignore = respectGitignore
 		self.respectRepoIgnore = respectRepoIgnore
 		self.respectCursorignore = respectCursorignore
@@ -775,6 +785,14 @@ public actor FileSystemService {
 		lastScannedEventIdByFolder: [String: FSEventStreamEventId]
 	) {
 		return (pendingScanTargets, lastScannedEventIdByFolder)
+	}
+
+	public func ingestStreamPayloadForTesting(
+		_ events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)]
+	) {
+		ingestStreamPayload(FSEventCallbackPayload(
+			entries: events.map { FSEventCallbackEntry(path: $0.absolutePath, flags: $0.flags, id: $0.eventId) }
+		))
 	}
 
 	public func enqueuePendingRawEventsForTesting(
@@ -2105,6 +2123,7 @@ public actor FileSystemService {
 			kFSEventStreamCreateFlagUseCFTypes
 			| kFSEventStreamCreateFlagFileEvents
 			| kFSEventStreamCreateFlagNoDefer
+			| kFSEventStreamCreateFlagWatchRoot   // RootChanged when the root is moved or removed
 		)
 
 		// Replay from just before the initial walk (when one ran while no
@@ -2167,6 +2186,7 @@ public actor FileSystemService {
 			fileSystemDebugLog("stream could not be stopped")
 		}
 
+		ingressEpoch &+= 1
 		resetWatcherIngressState()
 	}
 
@@ -2288,8 +2308,16 @@ public actor FileSystemService {
 
 		// Hand off into the actor context
 		Task { [service, payload] in
-			await service.enqueueFSEventHandlingTask(payload)
+			await service.ingestStreamPayload(payload)
 		}
+	}
+
+	/// Entry point for the stream callback. A callback that fired before
+	/// `stopWatchingForChanges()` can still reach the actor afterwards; its
+	/// events are dropped instead of re-arming the watcher.
+	private func ingestStreamPayload(_ payload: FSEventCallbackPayload) {
+		guard fseventStreamRef != nil else { return }
+		enqueueFSEventHandlingTask(payload)
 	}
 	
 	// MARK: - Core event coalescing & handling
@@ -2327,15 +2355,18 @@ public actor FileSystemService {
 	
 	private func scheduleCoalescingIfNeeded() {
 		guard coalescingTask == nil else { return }
+		let epoch = ingressEpoch
 		coalescingTask = Task {
 			do {
 				try await Task.sleep(nanoseconds: UInt64(coalescingDelay * 1_000_000_000))
 			} catch {
 				return
 			}
+			guard epoch == ingressEpoch else { return }
 			let events = takePendingFSEventsForProcessing()
 			
-			_ = await handleBatchedEvents(events)
+			_ = await handleBatchedEvents(events, ingressEpoch: epoch)
+			guard epoch == ingressEpoch else { return }
 			coalescingTask = nil
 			
 			// Re-arm if more events arrived while handling, or folders beyond
@@ -2793,7 +2824,8 @@ public actor FileSystemService {
 	
 	private func handleBatchedEvents(
 		_ events: [(String, FSEventStreamEventFlags, FSEventStreamEventId)],
-		testMode: Bool = false
+		testMode: Bool = false,
+		ingressEpoch batchEpoch: UInt64? = nil
 	) async -> [FileSystemDelta]? {
 		guard !events.isEmpty || !deferredFolderScans.isEmpty || !pendingSubtreeReconciles.isEmpty else {
 			return testMode ? [] : nil
@@ -3410,11 +3442,13 @@ public actor FileSystemService {
 		lastEventTargetIgnoreFastPathDiagnostics = eventTargetIgnoreFastPathDiagnostics
 		lastEventPathMappingFastPathDiagnostics = eventPathMappingFastPathDiagnostics
 		#endif
-		if !publishableDeltas.isEmpty {
+		// A pass that started before `stopWatchingForChanges()` publishes nothing.
+		let stoppedMeanwhile = batchEpoch.map { $0 != ingressEpoch } ?? false
+		if !publishableDeltas.isEmpty && !stoppedMeanwhile {
 			changePublisher.send(publishableDeltas)
 		}
 		FileSystemPublishPerf.end("coalesceAndPublishFileSystemDeltas", publishSignpost)
-		if (!deferredFolderScans.isEmpty || !pendingSubtreeReconciles.isEmpty) {
+		if !stoppedMeanwhile && (!deferredFolderScans.isEmpty || !pendingSubtreeReconciles.isEmpty) {
 			// No-op inside the coalescing task (it re-arms itself afterwards).
 			scheduleCoalescingIfNeeded()
 		}
@@ -6479,6 +6513,9 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		let relative = try containedRelativePath(rawRelativePath)
 		let absolute = StandardizedPath.join(standardizedRoot: standardizedRootPath, standardizedRelativePath: relative)
 		guard let realRoot = Self.posixRealPath(standardizedRootPath) else {
+			// A root that existed and is gone (moved, deleted, unmounted) must
+			// not be re-created by `createDirectory(withIntermediateDirectories:)`.
+			if rootExistedAtInit { throw FileSystemError.fileNotFound }
 			return (relative, absolute)
 		}
 		func isInsideRoot(_ resolved: String) -> Bool {
