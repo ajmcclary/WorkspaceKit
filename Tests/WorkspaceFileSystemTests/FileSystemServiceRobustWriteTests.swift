@@ -78,6 +78,17 @@ final class FileSystemServiceRobustWriteTests: XCTestCase {
 		XCTAssertEqual(Array(buffer.prefix(max(0, length))), tag)
 	}
 
+	func testWriteToADirectoryPathIsRefusedAndTheDirectoryKept() throws {
+		let folder = dirURL.appendingPathComponent("folder", isDirectory: true)
+		try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+		try Data("inside".utf8).write(to: folder.appendingPathComponent("child.txt"))
+
+		XCTAssertThrowsError(try FileSystemService.writeFileRobust(to: folder, data: Data("x".utf8)))
+
+		XCTAssertEqual(try String(contentsOf: folder.appendingPathComponent("child.txt"), encoding: .utf8), "inside")
+		XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dirURL.path), ["folder"])
+	}
+
 	func testWriteCreatesANewFile() throws {
 		let url = dirURL.appendingPathComponent("fresh.txt")
 		try FileSystemService.writeFileRobust(to: url, data: Data("fresh".utf8))

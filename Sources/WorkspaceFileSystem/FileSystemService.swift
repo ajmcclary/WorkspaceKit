@@ -6916,6 +6916,11 @@ public extension FileSystemService {
 		var destinationInfo = stat()
 		let destinationExists = lstat(path, &destinationInfo) == 0
 		let destinationIsRegularFile = destinationExists && (destinationInfo.st_mode & S_IFMT) == S_IFREG
+		// Only a regular file (or a symlink, which is replaced) is ever
+		// swapped out; a directory or special file at the path is refused.
+		if destinationExists, !destinationIsRegularFile, (destinationInfo.st_mode & S_IFMT) != S_IFLNK {
+			throw posixError(EISDIR, "write", path)
+		}
 
 		let tempPath = (directory as NSString).appendingPathComponent(".repoprompt.tmp.\(UUID().uuidString)")
 		let createError = writeNewFilePOSIX(
