@@ -275,4 +275,29 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		let service = try await makeService()
 		await assertInvalidRelativePath({ _ = try await service.loadContent(ofRelativePath: "../../outside/secret.txt") }, "loadContent")
 	}
+
+	func testReadsOpenTheCollapsedPathTheyChecked() async throws {
+		try FileManager.default.createDirectory(at: outsideURL.appendingPathComponent("sub"), withIntermediateDirectories: true)
+		try "secret".write(to: outsideURL.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
+		try FileManager.default.createSymbolicLink(
+			at: rootURL.appendingPathComponent("lsub"),
+			withDestinationURL: outsideURL.appendingPathComponent("sub")
+		)
+		let service = try await makeService()
+
+		for read in [
+			{ _ = try await service.loadContent(ofRelativePath: "lsub/../secret.txt") },
+			{ _ = try await service.loadEntireFileContentOptimized(ofRelativePath: "lsub/../secret.txt") },
+			{ _ = try await service.readFileContent(atRelativePath: "lsub/../secret.txt") }
+		] as [() async throws -> Void] {
+			do {
+				try await read()
+				XCTFail("read the file outside the root")
+			} catch FileSystemError.fileNotFound {
+				// expected: the collapsed path, root/secret.txt, does not exist
+			} catch {
+				XCTFail("unexpected \(error)")
+			}
+		}
+	}
 }

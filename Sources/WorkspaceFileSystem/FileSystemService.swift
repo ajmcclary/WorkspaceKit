@@ -4874,7 +4874,9 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 
 	let fm = self.fm  // Cache for multiple calls in this method
 	let encodingKey = try containedRelativePath(relativePath)
-	let fullPath = getFullPath(forRelativePath: relativePath)
+	// Open the collapsed path that was checked, not the raw spelling: the
+	// kernel resolves `..` after following a symlink.
+	let fullPath = getFullPath(forRelativePath: encodingKey)
 	guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
 		throw FileSystemError.fileNotFound
 	}
@@ -4964,7 +4966,7 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		let fm = self.fm  // Cache for multiple calls in this method
 		
 		let encodingKey = try containedRelativePath(relativePath)
-		let fullPath = getFullPath(forRelativePath: relativePath)
+		let fullPath = getFullPath(forRelativePath: encodingKey)
 		guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
 			throw FileSystemError.fileNotFound
 		}
