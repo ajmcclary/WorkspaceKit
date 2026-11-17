@@ -10,6 +10,13 @@ final class GitignoreLineParsingTests: XCTestCase {
 		GitignoreCompiler.compile(content: content)
 	}
 
+	func testCanonicalSpellingsKeepTheirOwnPatternBytes() {
+		let rules = ["normalization-caf\u{e9}.txt", "normalization-cafe\u{301}.txt"]
+		for rule in rules {
+			XCTAssertTrue(GitignoreCompiler.compile(content: rule).denies(rule, isDirectory: false))
+		}
+	}
+
 	func testLeadingWhitespaceIsPartOfThePattern() {
 		let compiled = rules("  build\n\t#notacomment\n")
 		XCTAssertFalse(compiled.denies("build", isDirectory: true), "Git does not strip leading whitespace")

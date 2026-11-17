@@ -123,9 +123,12 @@ public actor IgnoreRulesManager {
 	private let ioSemaphore = TaskSemaphore(4)               // Max 4 concurrent file reads
 	// Compile-result cache keyed by (dev, ino, mtime) to avoid duplicate work across symlinks.
 	private struct FileMetaKey: Hashable {
-		let dev: UInt64
-		let ino: UInt64
-		let mtime: UInt64
+		let dev: dev_t
+		let ino: ino_t
+		let seconds: Int
+		let nanoseconds: Int
+		let changeSeconds: Int
+		let changeNanoseconds: Int
 	}
 	private var compiledCache = LRUCache<FileMetaKey, Task<CompiledIgnoreRules, Error>>(
 		capacity: 500
@@ -141,28 +144,22 @@ public actor IgnoreRulesManager {
 	#endif
 
 	// MARK: - File metadata helper
-	/// Compute a unique cache key based on (device, inode, modification time).
-	/// Falls back to a hash of the path if `stat()` fails.
-	private func fileMetaKey(for url: URL) -> FileMetaKey {
+	/// Cache only when the filesystem supplied an identity and change times.
+	private func fileMetaKey(for url: URL) -> FileMetaKey? {
 		var st = stat()
-		if stat(url.path, &st) == 0 {
-			let dev  = UInt64(st.st_dev)
-			let ino  = UInt64(st.st_ino)
-			#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-			let mtime = UInt64(st.st_mtimespec.tv_sec)
-			#else
-			let mtime = UInt64(st.st_mtim.tv_sec)
-			#endif
-			return FileMetaKey(dev: dev, ino: ino, mtime: mtime)
-		}
-		// Fallback – rare (e.g. file deleted between calls)
-		return FileMetaKey(
-			dev: 0,
-			ino: UInt64(url.path.hashValue),
-			mtime: 0
-		)
+		guard stat(url.path, &st) == 0 else { return nil }
+		#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+		let modified = st.st_mtimespec
+		let changed = st.st_ctimespec
+		#else
+		let modified = st.st_mtim
+		let changed = st.st_ctim
+		#endif
+		return FileMetaKey(dev: st.st_dev, ino: st.st_ino,
+			seconds: modified.tv_sec, nanoseconds: modified.tv_nsec,
+			changeSeconds: changed.tv_sec, changeNanoseconds: changed.tv_nsec)
 	}
-	
+
 	/// Loads .gitignore and/or .repo_ignore content from disk, merges them into a single IgnoreRules.
 	public func getIgnoreRules(
 		for path: String,
@@ -232,7 +229,7 @@ public actor IgnoreRulesManager {
 	/// The first caller starts the compilation task; subsequent callers await
 	/// the same task, ensuring the file is compiled exactly once.
 	public func compiledIgnoreFile(at url: URL) async throws -> CompiledIgnoreRules {
-		let key = fileMetaKey(for: url)
+		guard let key = fileMetaKey(for: url) else { return try compileIgnoreFile(at: url) }
 		
 		// Fast path: if we already have a task in-flight or completed, just await it.
 		if let existing = compiledCache[key] {
@@ -246,10 +243,7 @@ public actor IgnoreRulesManager {
 			do {
 				// Perform the (blocking) file read on the current executor – it's fine
 				// because we have limited the total number of concurrent reads.
-				let txt = try String(contentsOf: url, encoding: .utf8)
-				
-				// Compile patterns
-				let compiled = GitignoreCompiler.compile(content: txt)
+				let compiled = try compileIgnoreFile(at: url)
 				
 				// Release the permit before returning
 				await ioSemaphore.release()
@@ -274,22 +268,9 @@ public actor IgnoreRulesManager {
 		}
 	}
 
-	/// Deprecated synchronous helper kept for backward compatibility.
-	/// Internally forwards to the new async version.
+	/// Synchronous compatibility entry point. Reads the current file directly.
 	public func compileIgnoreFile(at url: URL) throws -> CompiledIgnoreRules {
-		// Blocking on async helper – acceptable because it is used only in tests.
-		let semaphore = DispatchSemaphore(value: 0)
-		var output: CompiledIgnoreRules!
-		var caughtErr: Error?
-		
-		Task {
-			do   { output = try await compiledIgnoreFile(at: url) }
-			catch { caughtErr = error }
-			semaphore.signal()
-		}
-		semaphore.wait()
-		
-		if let err = caughtErr { throw err }
-		return output
+		let content = try String(contentsOf: url, encoding: .utf8)
+		return GitignoreCompiler.compile(content: content)
 	}
 }
