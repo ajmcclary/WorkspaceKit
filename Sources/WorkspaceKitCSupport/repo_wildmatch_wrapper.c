@@ -9,6 +9,7 @@
 #include "repo_wildmatch.h"
 #include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 /* Swift-friendly wrapper that matches the function signature we'll use */
@@ -152,19 +153,15 @@ int repo_gitignore_match_anywhere(const char *pattern, const char *path)
 
     /* Preserve legacy non-anchored slash-pattern behavior at subpath boundaries. */
     if (pattern_ends_with_slash_double_star(pattern)) {
-        char base_pattern[1024];
-        size_t pattern_len = strlen(pattern);
-        size_t base_len = pattern_len - 3;
-
-        if (base_len == 0 || base_len >= sizeof(base_pattern)) {
-            return WM_NOMATCH;
-        }
-
-        memcpy(base_pattern, pattern, base_len);
-        base_pattern[base_len] = '\0';
-
-        if (match_each_subpath(base_pattern, path, flags) == WM_MATCH) {
-            return WM_MATCH;
+        const size_t base_len = strlen(pattern) - 3;
+        char local[1024];
+        char *base_pattern = base_len < sizeof(local) ? local : malloc(base_len + 1);
+        if (base_len > 0 && base_pattern != NULL) {
+            memcpy(base_pattern, pattern, base_len);
+            base_pattern[base_len] = '\0';
+            int base_result = match_each_subpath(base_pattern, path, flags);
+            if (base_pattern != local) free(base_pattern);
+            if (base_result == WM_MATCH) return WM_MATCH;
         }
     }
 
@@ -232,17 +229,18 @@ static void trim_trailing_whitespace_preserving_escapes(char *text)
 }
 
 /* Parse a single gitignore line into a pattern structure */
-bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result)
+bool repo_parse_gitignore_line_into(const char *line, char *pattern, size_t capacity,
+                                    bool *is_negation, bool *directory_only, bool *absolute)
 {
     size_t len;
     const char *p = line;
-    char temp[1024];
+    if (capacity == 0) return false;
     
     /* Initialize result */
-    result->pattern[0] = '\0';
-    result->is_negation = false;
-    result->directory_only = false;
-    result->absolute = false;
+    pattern[0] = '\0';
+    *is_negation = false;
+    *directory_only = false;
+    *absolute = false;
     
     /* Git keeps leading whitespace: it is part of the pattern, and a line
      * that starts with whitespace is not a comment. */
@@ -254,7 +252,7 @@ bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result)
     
     /* Check for negation. Only the first unescaped ! is special. */
     if (*p == '!') {
-        result->is_negation = true;
+        *is_negation = true;
         p++;
         if ((p[0] == '\\' && p[1] == '!') || (p[0] == '\\' && p[1] == '#')) {
             p++; /* Skip only the escape, leaving the literal character. */
@@ -265,31 +263,37 @@ bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result)
     
     /* Check for leading slash (absolute path) */
     if (*p == '/') {
-        result->absolute = true;
+        *absolute = true;
         p++;
     }
     
     /* Copy pattern, removing trailing whitespace. A line too long for the
      * buffer is skipped: truncating it would yield a different pattern. */
     len = strlen(p);
-    if (len >= sizeof(temp)) {
+    if (len >= capacity) {
         return false;
     }
-    memcpy(temp, p, len + 1);
+    memcpy(pattern, p, len + 1);
     
     /* Trim trailing whitespace, preserving escaped trailing spaces/tabs. */
-    trim_trailing_whitespace_preserving_escapes(temp);
-    len = strlen(temp);
+    trim_trailing_whitespace_preserving_escapes(pattern);
+    len = strlen(pattern);
     
     /* Check for trailing slash (directory only) */
-    if (len > 0 && temp[len-1] == '/') {
-        result->directory_only = true;
-        temp[len-1] = '\0';
+    if (len > 0 && pattern[len-1] == '/') {
+        *directory_only = true;
+        pattern[len-1] = '\0';
     }
     
     /* Normalize the pattern */
-    repo_normalize_pattern(result->pattern, temp, sizeof(result->pattern));
+    repo_normalize_pattern(pattern, pattern, capacity);
     
     /* Don't process empty patterns */
-    return result->pattern[0] != '\0';
+    return pattern[0] != '\0';
+}
+
+bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result)
+{
+    return repo_parse_gitignore_line_into(line, result->pattern, sizeof(result->pattern),
+                                          &result->is_negation, &result->directory_only, &result->absolute);
 }

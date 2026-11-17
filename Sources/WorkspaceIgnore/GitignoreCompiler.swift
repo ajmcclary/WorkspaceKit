@@ -857,23 +857,25 @@ public final class GitignoreCompiler {
 		
 		for line in lines {
 			line.withCString { lineC in
-				var parsedPattern = repo_gitignore_pattern()
-				
-				// Parse the line using C function
-				if repo_parse_gitignore_line(lineC, &parsedPattern) {
-					// Convert C array to Swift String
-					let patternStr = withUnsafeBytes(of: parsedPattern.pattern) { bytes in
-						let cString = bytes.bindMemory(to: CChar.self).baseAddress!
-						return String(cString: cString)
-					}
-					
-					let anchoredToIgnoreFileDirectory = parsedPattern.absolute || patternStr.contains("/")
+				var negated = false
+				var directoryOnly = false
+				var absolutePattern = false
+				let pattern = withUnsafeTemporaryAllocation(of: CChar.self, capacity: line.utf8.count + 1) { buffer in
+					guard let address = buffer.baseAddress,
+						repo_parse_gitignore_line_into(
+							lineC, address, buffer.count, &negated, &directoryOnly, &absolutePattern
+						)
+					else { return nil as String? }
+					return String(cString: address)
+				}
+				if let patternStr = pattern {
+					let anchoredToIgnoreFileDirectory = absolutePattern || patternStr.contains("/")
 					let prefix = escapedGlobLiteral(directoryPath.hasSuffix("/") ? String(directoryPath.dropLast()) : directoryPath)
 					var adjustedPattern = patternStr
 					var absolute = anchoredToIgnoreFileDirectory
 					var prefilter = makePrefilter(
 						pattern: patternStr,
-						directoryOnly: parsedPattern.directory_only,
+						directoryOnly: directoryOnly,
 						absolute: anchoredToIgnoreFileDirectory
 					)
 					if !prefix.isEmpty {
@@ -881,7 +883,7 @@ public final class GitignoreCompiler {
 							adjustedPattern = "\(prefix)/\(adjustedPattern)"
 							prefilter = makePrefilter(
 								pattern: adjustedPattern,
-								directoryOnly: parsedPattern.directory_only,
+								directoryOnly: directoryOnly,
 								absolute: true
 							)
 						} else {
@@ -900,8 +902,8 @@ public final class GitignoreCompiler {
 					
 					let pat = GitPattern(
 						pattern: interned,
-						isNegation: parsedPattern.is_negation,
-						directoryOnly: parsedPattern.directory_only,
+						isNegation: negated,
+						directoryOnly: directoryOnly,
 						absolute: absolute,
 						prefilter: prefilter
 					)

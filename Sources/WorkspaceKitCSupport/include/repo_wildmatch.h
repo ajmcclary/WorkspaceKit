@@ -36,6 +36,10 @@ typedef struct {
 /* Parse a single gitignore line into a pattern structure */
 bool repo_parse_gitignore_line(const char *line, repo_gitignore_pattern *result);
 
+/* Parse into a caller-owned buffer of at least strlen(line) + 1 bytes. */
+bool repo_parse_gitignore_line_into(const char *line, char *pattern, size_t capacity,
+                                    bool *is_negation, bool *directory_only, bool *absolute);
+
 #ifdef __cplusplus
 }
 #endif
