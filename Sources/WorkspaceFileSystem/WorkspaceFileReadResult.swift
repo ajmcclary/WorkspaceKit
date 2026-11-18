@@ -27,4 +27,33 @@ public enum WorkspaceFileReadResult: Sendable, Equatable {
 		if case .text(let text, _, _) = self { return text }
 		return nil
 	}
+
+	/// Encodes an edit using the format of the file that was read for review.
+	public func encodingReplacement(_ replacement: String) throws -> Data {
+		guard case .text(_, let encoding, let hasByteOrderMark) = self else {
+			throw FileSystemError.failedToEditFile(CocoaError(.fileWriteInapplicableStringEncoding))
+		}
+		return try Self.encode(replacement, using: encoding, hasByteOrderMark: hasByteOrderMark)
+	}
+
+	static func encode(_ text: String, using encoding: String.Encoding, hasByteOrderMark: Bool) throws -> Data {
+		guard let data = text.data(using: encoding) else {
+			throw FileSystemError.failedToEditFile(CocoaError(.fileWriteInapplicableStringEncoding))
+		}
+		if hasByteOrderMark, let mark = byteOrderMark(for: encoding), !data.starts(with: mark) {
+			return mark + data
+		}
+		return data
+	}
+
+	static func byteOrderMark(for encoding: String.Encoding) -> Data? {
+		switch encoding {
+		case .utf8: return Data([0xEF, 0xBB, 0xBF])
+		case .utf16LittleEndian: return Data([0xFF, 0xFE])
+		case .utf16BigEndian: return Data([0xFE, 0xFF])
+		case .utf32LittleEndian: return Data([0xFF, 0xFE, 0x00, 0x00])
+		case .utf32BigEndian: return Data([0x00, 0x00, 0xFE, 0xFF])
+		default: return nil
+		}
+	}
 }

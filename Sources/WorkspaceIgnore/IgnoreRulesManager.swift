@@ -106,7 +106,6 @@ public enum IgnoreSettingsDefaults {
 /// A lightweight manager that builds `IgnoreRules` on demand, with no caching.
 public actor IgnoreRulesManager {
 	public static let shared = IgnoreRulesManager()
-	private let fileManager = FileManager.default
 
 	#if DEBUG
 	private var fileManagerOverride: (any TestFS)?
@@ -114,10 +113,6 @@ public actor IgnoreRulesManager {
 	public func setFileManagerOverride(_ fm: (any TestFS)?) {
 		self.fileManagerOverride = fm
 	}
-
-	private var fm: any TestFS { fileManagerOverride ?? fileManager }
-	#else
-	private var fm: FileManager { fileManager }
 	#endif
 
 	private let ioSemaphore = TaskSemaphore(4)               // Max 4 concurrent file reads
@@ -167,64 +162,75 @@ public actor IgnoreRulesManager {
 		respectRepoIgnore: Bool = true,
 		respectCursorignore: Bool = true
 	) async throws -> IgnoreRules {
-		let ignoreRules = IgnoreRules()
-		
-		// If we want to load .gitignore content:
-		if respectGitignore {
-			let gitignorePath = (path as NSString).appendingPathComponent(".gitignore")
-			if fm.fileExists(atPath: gitignorePath, isDirectory: nil) {
-				let gitignoreContent = try await loadFileContent(at: gitignorePath)
-				ignoreRules.addIgnoreFile(content: gitignoreContent, priority: 1)
-			}
-		}
-		
-		// Always add global ignore defaults from user settings (lower priority)
-		let globalIgnoreContent = fetchGlobalDefaults()
-		ignoreRules.addIgnoreFile(content: globalIgnoreContent, priority: 2)
-		
-		// If enabled and a local .repo_ignore exists, add it with higher priority (overriding global defaults)
-		if respectRepoIgnore {
-			let repoIgnorePath = (path as NSString).appendingPathComponent(".repo_ignore")
-			if fm.fileExists(atPath: repoIgnorePath, isDirectory: nil) {
-				let repoIgnoreContent = try await loadFileContent(at: repoIgnorePath)
-				ignoreRules.addIgnoreFile(content: repoIgnoreContent, priority: 3)
-			}
-		}
-
-		// If enabled and a local .cursorignore exists, add it with highest local priority.
-		if respectCursorignore {
-			let cursorignorePath = (path as NSString).appendingPathComponent(".cursorignore")
-			if fm.fileExists(atPath: cursorignorePath, isDirectory: nil) {
-				let cursorignoreContent = try await loadFileContent(at: cursorignorePath)
-				ignoreRules.addIgnoreFile(content: cursorignoreContent, priority: 4)
-			}
-		}
-		
-		return ignoreRules
-	}
-	
-	private func loadFileContent(at path: String) async throws -> String {
+		// This standalone entry point authorizes the supplied directory. Verify
+		// the opened regular file's kernel path before reading a linked ignore file.
 		#if DEBUG
-		if let data = fm.contents(atPath: path),
-			let str = String(data: data, encoding: .utf8) {
-			return str
+		if let override = fileManagerOverride, !(override is FileManager) {
+			func read(_ name: String) -> String? {
+				override.contents(atPath: (path as NSString).appendingPathComponent(name))
+					.flatMap { String(data: $0, encoding: .utf8) }
+			}
+			return Self.rootRules(git: respectGitignore ? read(".gitignore") : nil,
+				repo: respectRepoIgnore ? read(".repo_ignore") : nil,
+				cursor: respectCursorignore ? read(".cursorignore") : nil)
 		}
 		#endif
-		return try String(contentsOfFile: path, encoding: .utf8)
-	}
-	
-	private func fetchGlobalDefaults() -> String {
-		#if DEBUG
-		// In test runs, always return canonical defaults to ensure deterministic behavior.
-		// This prevents user-customized patterns from leaking into tests.
-		if Self.isRunningTests {
-			return IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
+		let directory = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+		guard directory >= 0 else { return Self.rootRules(git: nil, repo: nil, cursor: nil) }
+		defer { close(directory) }
+		#if canImport(Darwin)
+		func descriptorPath(_ fd: Int32) throws -> String {
+			var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+			guard fcntl(fd, F_GETPATH, &buffer) == 0 else {
+				throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+			}
+			return String(decoding: buffer.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self)
 		}
+		let rootPath = try descriptorPath(directory)
+		let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
 		#endif
-
-		return IgnoreSettingsDefaults.resolvedGlobalIgnoreDefaults(defaults: .standard)
+		func read(_ name: String) throws -> String? {
+			#if canImport(Darwin)
+			let fd = openat(directory, name, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY)
+			#else
+			let fd = openat(directory, name, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)
+			#endif
+			guard fd >= 0 else {
+				if errno == ENOENT || errno == ELOOP { return nil }
+				throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+			}
+			let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+			defer { try? handle.close() }
+			var info = stat()
+			guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+			#if canImport(Darwin)
+			guard try descriptorPath(fd).hasPrefix(prefix), try descriptorPath(directory) == rootPath else { return nil }
+			#endif
+			guard let text = String(data: try handle.readToEnd() ?? Data(), encoding: .utf8) else {
+				throw CocoaError(.fileReadInapplicableStringEncoding)
+			}
+			return text
+		}
+		return try Self.rootRules(git: respectGitignore ? read(".gitignore") : nil,
+			repo: respectRepoIgnore ? read(".repo_ignore") : nil,
+			cursor: respectCursorignore ? read(".cursorignore") : nil)
 	}
-	
+
+	/// A workspace service supplies text from files opened under its own root and link policy.
+	package nonisolated static func rootRules(git: String?, repo: String?, cursor: String?) -> IgnoreRules {
+		let rules = IgnoreRules()
+		if let git { rules.addIgnoreFile(content: git, priority: 1) }
+		#if DEBUG
+		let defaults = isRunningTests ? IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults : IgnoreSettingsDefaults.resolvedGlobalIgnoreDefaults()
+		#else
+		let defaults = IgnoreSettingsDefaults.resolvedGlobalIgnoreDefaults()
+		#endif
+		rules.addIgnoreFile(content: defaults, priority: 2)
+		if let repo { rules.addIgnoreFile(content: repo, priority: 3) }
+		if let cursor { rules.addIgnoreFile(content: cursor, priority: 4) }
+		return rules
+	}
+
 	/// Asynchronously compile a `.gitignore` / `.repo_ignore` file.
 	/// The first caller starts the compilation task; subsequent callers await
 	/// the same task, ensuring the file is compiled exactly once.

@@ -149,6 +149,7 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		try FileManager.default.createSymbolicLink(atPath: rootURL.appendingPathComponent("divdir2").path, withDestinationPath: "la2/..")
 		let service = try await makeService()
 
+		await service.updateSkipSymlinks(false)
 		let read = try await service.loadContent(ofRelativePath: "div2")
 		XCTAssertEqual(read, "real")
 		try await service.editFile(atRelativePath: "div2", newContent: "EDITED")
@@ -322,6 +323,62 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		try "secret".write(to: outsideURL.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
 		let service = try await makeService()
 		await assertInvalidRelativePath({ _ = try await service.loadContent(ofRelativePath: "../../outside/secret.txt") }, "loadContent")
+	}
+
+	func testCatalogAndContentReadsHonorLinkPolicy() async throws {
+		let fm = FileManager.default
+		let localFile = rootURL.appendingPathComponent("note.txt")
+		try "local".write(to: localFile, atomically: true, encoding: .utf8)
+		let otherFile = outsideURL.appendingPathComponent("note.txt")
+		try "other".write(to: otherFile, atomically: true, encoding: .utf8)
+		try fm.createSymbolicLink(at: rootURL.appendingPathComponent("local-link.txt"), withDestinationURL: localFile)
+		try fm.createSymbolicLink(at: rootURL.appendingPathComponent("other-link.txt"), withDestinationURL: otherFile)
+		try fm.createSymbolicLink(at: rootURL.appendingPathComponent("other-dir"), withDestinationURL: outsideURL)
+		let service = try await makeService()
+
+		var files: [String] = []
+		for try await event in await service.loadContentsInChunks(of: rootURL) {
+			if case .preparedItems(let chunk) = event { files += chunk.files.map(\.relativePath) }
+		}
+		XCTAssertEqual(files, ["note.txt"])
+		await assertInvalidRelativePath({ _ = try await service.readFileContent(atRelativePath: "local-link.txt") }, "skip links")
+
+		await service.updateSkipSymlinks(false)
+		let (result, _) = try await service.readFileContentWithDate(atRelativePath: "local-link.txt")
+		XCTAssertEqual(result.text, "local")
+		for path in ["other-link.txt", "other-dir/note.txt"] {
+			await assertInvalidRelativePath({ _ = try await service.readFileContentWithDate(atRelativePath: path) }, path)
+			await assertInvalidRelativePath({ _ = try await service.loadContent(ofRelativePath: path) }, path)
+			await assertInvalidRelativePath({ _ = try await service.loadEntireFileContentOptimized(ofRelativePath: path) }, path)
+		}
+	}
+
+	func testRootBindingRejectsRedirectedRootAndAllowsDeferredCreation() async throws {
+		let fm = FileManager.default
+		let pendingRoot = rootURL.appendingPathComponent("pending")
+		let service = try await FileSystemService(path: pendingRoot.path)
+		try await service.createFile(atRelativePath: "first.txt", content: "local")
+		let read = try await service.readFileContent(atRelativePath: "first.txt")
+		XCTAssertEqual(read.text, "local")
+
+		let alias = rootURL.appendingPathComponent("alias")
+		try fm.createSymbolicLink(at: alias, withDestinationURL: pendingRoot)
+		let bound = try await FileSystemService(path: alias.path)
+		try fm.removeItem(at: alias)
+		try fm.createSymbolicLink(at: alias, withDestinationURL: outsideURL)
+		await assertInvalidRelativePath({ _ = try await bound.readFileContent(atRelativePath: "first.txt") }, "changed root")
+		await assertInvalidRelativePath({ try await bound.createFile(atRelativePath: "first.txt", content: "new") }, "changed root")
+		XCTAssertEqual(try fm.contentsOfDirectory(atPath: outsideURL.path), [])
+	}
+
+	func testCreateOnlyPublicationPreservesExistingEntry() throws {
+		let root = try ContainedRoot(path: rootURL.path, alternateSpellings: [])
+		let file = rootURL.appendingPathComponent("existing.txt")
+		try Data("original".utf8).write(to: file)
+		XCTAssertThrowsError(try FileSystemService.writeFileRobust(
+			inDirectory: root.directory, name: "existing.txt", data: Data("new".utf8), createOnly: true
+		))
+		XCTAssertEqual(try Data(contentsOf: file), Data("original".utf8))
 	}
 
 	func testReadsOpenTheCollapsedPathTheyChecked() async throws {

@@ -50,9 +50,11 @@ final class ContainedRoot: @unchecked Sendable {
 	let realPath: String
 	/// Other spellings of the root an absolute symlink target may use.
 	private let spellings: [String]
+	private let followSymlinks: Bool
 
 	/// Opens `path` (following symlinks in the root path itself, once).
-	init(path: String, alternateSpellings: [String]) throws {
+	init(path: String, alternateSpellings: [String], followSymlinks: Bool = true) throws {
+		self.followSymlinks = followSymlinks
 		let fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
 		guard fd >= 0 else {
 			throw FileSystemError.fileNotFound
@@ -184,6 +186,7 @@ final class ContainedRoot: @unchecked Sendable {
 			}
 			switch info.st_mode & S_IFMT {
 			case S_IFLNK:
+				guard followSymlinks else { throw FileSystemError.invalidRelativePath }
 				hops += 1
 				guard hops <= Self.maxSymlinkHops, let target = readLink(named: component, in: current) else {
 					throw FileSystemError.invalidRelativePath
@@ -251,6 +254,7 @@ final class ContainedRoot: @unchecked Sendable {
 			case S_IFREG:
 				return (directory, leaf)
 			case S_IFLNK:
+				guard followSymlinks else { throw FileSystemError.invalidRelativePath }
 				hops += 1
 				guard hops <= Self.maxSymlinkHops, let link = readLink(named: leaf, in: directory) else {
 					throw FileSystemError.invalidRelativePath
@@ -268,6 +272,19 @@ final class ContainedRoot: @unchecked Sendable {
 		}
 	}
 
+	/// Opens the verified leaf without following a replacement link. Nonblocking
+	/// open also prevents a replacement FIFO from stalling the reader before fstat.
+	func openForReading(_ components: [String]) throws -> (handle: FileHandle, info: stat) {
+		let (parent, leaf) = try openExistingRegularFile(components)
+		let fd = openat(parent.fd, leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)
+		guard fd >= 0 else { throw Self.posixError(errno, "openat", leaf) }
+		let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+		var info = stat()
+		guard fstat(fd, &info) == 0 else { throw Self.posixError(errno, "fstat", leaf) }
+		guard (info.st_mode & S_IFMT) == S_IFREG else { throw FileSystemError.invalidRelativePath }
+		return (handle, info)
+	}
+
 	// MARK: - Entry queries
 
 	/// `lstat` of `name` in `directory`, or nil when nothing is there.
@@ -277,8 +294,8 @@ final class ContainedRoot: @unchecked Sendable {
 	}
 
 	/// Something exists at `name`: an entry that is not a symlink, or a
-	/// symlink whose target exists (a dangling link counts as absent and is
-	/// replaced by a create, as before).
+	/// symlink whose target exists. Exclusive creation also refuses a dangling
+	/// directory entry when publishing the new file.
 	static func entryExists(_ name: String, in directory: ContainedDirectory) -> Bool {
 		guard let info = entryInfo(name, in: directory) else { return false }
 		if (info.st_mode & S_IFMT) != S_IFLNK { return true }

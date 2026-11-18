@@ -32,6 +32,12 @@ final class FileSystemServiceTypedReadTests: XCTestCase {
 		try Data(bytes).write(to: rootURL.appendingPathComponent(name))
 	}
 
+	func testReplacementUsesReviewedEncodingAndRejectsNonText() throws {
+		let result = WorkspaceFileReadResult.text("A", encoding: .utf16LittleEndian, hasByteOrderMark: true)
+		XCTAssertEqual(try result.encodingReplacement("B"), Data([0xff, 0xfe, 0x42, 0x00]))
+		XCTAssertThrowsError(try WorkspaceFileReadResult.binary.encodingReplacement("B"))
+	}
+
 	func testFileOverTheLimitIsReportedAsTooLargeNotAsText() async throws {
 		try write(Array(repeating: 0x61, count: 100), to: "big.swift")
 		let service = try await makeService()

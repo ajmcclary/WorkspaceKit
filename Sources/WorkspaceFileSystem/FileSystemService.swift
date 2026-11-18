@@ -387,12 +387,6 @@ public actor FileSystemService {
 		return fileManagerOverride ?? fileManager
 	}
 
-	/// `fm`, boxed so it can be read from another isolation domain (the
-	/// off-actor scan helpers). `TestFS` cannot refine `Sendable` — see
-	/// `TestFSTransfer` for the invariant that makes this legal.
-	private var fmTransfer: TestFSTransfer {
-		TestFSTransfer(fm)
-	}
 	#else
 	/// In release builds, always use FileManager.default
 	private var fm: FileManager { fileManager }
@@ -426,7 +420,7 @@ public actor FileSystemService {
 	private var selfPointer: UnsafeMutableRawPointer?
 	
 	/// The in-memory IgnoreRules instance for our path
-	private var ignoreRules: IgnoreRules
+	private var ignoreRules = IgnoreRules()
 	
 	private var ignoreCacheStore = IgnoreCacheStore()
 	
@@ -553,7 +547,7 @@ public actor FileSystemService {
 		self.rootURL = URL(fileURLWithPath: path).standardizedFileURL
 		self.canonicalRootURL = rootURL.resolvingSymlinksInPath()
 		let initialRealRoot = Self.posixRealPath(rootURL.path)
-		self.realRootPath = initialRealRoot ?? canonicalRootURL.path
+		self.realRootPath = initialRealRoot ?? Self.plannedRealPath(rootURL.path)
 		self.rootExistedAtInit = initialRealRoot != nil
 		self.respectGitignore = respectGitignore
 		self.respectRepoIgnore = respectRepoIgnore
@@ -567,12 +561,7 @@ public actor FileSystemService {
 		self.maxFoldersPerBatch = 256
 		
 		// Load fresh ignore rules from manager, no caching done by manager
-		self.ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
-			for: path,
-			respectGitignore: respectGitignore,
-			respectRepoIgnore: respectRepoIgnore,
-			respectCursorignore: respectCursorignore
-		)
+		self.ignoreRules = try loadRootIgnoreRules()
 		
 		// Initialize root-level ignore rules in per-folder cache
 		cacheIgnoreRules(ignoreRules, for: "")
@@ -700,7 +689,7 @@ public actor FileSystemService {
 		self.rootURL = URL(fileURLWithPath: path).standardizedFileURL
 		self.canonicalRootURL = rootURL.resolvingSymlinksInPath()
 		let initialRealRoot = Self.posixRealPath(rootURL.path)
-		self.realRootPath = initialRealRoot ?? canonicalRootURL.path
+		self.realRootPath = initialRealRoot ?? Self.plannedRealPath(rootURL.path)
 		self.rootExistedAtInit = initialRealRoot != nil
 		self.respectGitignore = respectGitignore
 		self.respectRepoIgnore = respectRepoIgnore
@@ -723,29 +712,11 @@ public actor FileSystemService {
 			self.visitedItems = items
 		}
 		
-		#if DEBUG
-		// Keep the singleton test override scoped to this service. Passing nil is
-		// intentional: earlier InMemoryFS tests must not leak into later real-FS tests.
-		//
-		// The double is deliberately observed by BOTH this actor and the
-		// IgnoreRulesManager actor, so it has to cross an isolation boundary.
-		// `TestFSTransfer` carries the documented invariant that makes that
-		// legal (see its doc comment); `TestFS` itself cannot refine `Sendable`
-		// because `FileManager` conforms to it.
-		let overrideTransfer = TestFSTransfer(fileManagerOverride)
-		await IgnoreRulesManager.shared.setFileManagerOverride(overrideTransfer.fileSystem)
-		#endif
-
 		// Use test ignore rules or load fresh ones
 		if let rules = testIgnoreRules {
 			self.ignoreRules = rules
 		} else {
-			self.ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
-				for: path,
-				respectGitignore: respectGitignore,
-				respectRepoIgnore: respectRepoIgnore,
-				respectCursorignore: respectCursorignore
-			)
+			self.ignoreRules = try loadRootIgnoreRules()
 		}
 		
 		// Initialize root-level ignore rules in per-folder cache
@@ -997,8 +968,21 @@ public actor FileSystemService {
 	}
 	
 	public func fileExistsOnDisk(relativePath: String) -> Bool {
-		let absolutePath = getFullPath(forRelativePath: relativePath)
-		return fm.fileExists(atPath: absolutePath, isDirectory: nil)
+		#if DEBUG
+		if let fs = fileManagerOverride, !(fs is FileManager) {
+			return fs.fileExists(atPath: getFullPath(forRelativePath: relativePath), isDirectory: nil)
+		}
+		#endif
+		guard let root = try? verifiedDiskRoot(followSymlinks: !skipSymlinks) else { return false }
+		if relativePath.isEmpty { return true }
+		guard let key = try? containedRelativePath(relativePath) else { return false }
+		let components = Self.components(key)
+		guard let parent = try? root.openParent(of: components, createMissing: false),
+			let info = ContainedRoot.entryInfo(parent.leaf, in: parent.directory) else { return false }
+		if info.st_mode & S_IFMT != S_IFLNK { return true }
+		guard !skipSymlinks else { return false }
+		return (try? root.openExistingRegularFile(components)) != nil ||
+			(try? root.openDirectory(components, createMissing: false)) != nil
 	}
 
 	private func standardizedCatalogRelativePath(_ rawRelativePath: String) -> String {
@@ -1006,29 +990,18 @@ public actor FileSystemService {
 	}
 
 	public func regularFileExistsOnDisk(relativePath rawRelativePath: String) -> Bool {
-		let relativePath = standardizedCatalogRelativePath(rawRelativePath)
-		guard !relativePath.isEmpty, !relativePath.hasPrefix("../"), relativePath != ".." else {
-			return false
+		guard let key = try? containedRelativePath(rawRelativePath) else { return false }
+		#if DEBUG
+		if let fs = fileManagerOverride, !(fs is FileManager) {
+			var isDirectory = ObjCBool(false)
+			return fs.fileExists(atPath: getFullPath(forRelativePath: key), isDirectory: &isDirectory) && !isDirectory.boolValue
 		}
-		let absolutePath = getFullPath(forRelativePath: relativePath)
-		let standardizedAbsolutePath = (absolutePath as NSString).standardizingPath
-		let rootPrefix = standardizedRootPath.hasSuffix("/") ? standardizedRootPath : standardizedRootPath + "/"
-		guard standardizedAbsolutePath == standardizedRootPath || standardizedAbsolutePath.hasPrefix(rootPrefix) else {
-			return false
-		}
-
-		var isDirectory = ObjCBool(false)
-		guard fm.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), !isDirectory.boolValue else {
-			return false
-		}
-		if let values = try? URL(fileURLWithPath: standardizedAbsolutePath).resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-			if values.isSymbolicLink == true { return false }
-			if values.isRegularFile == false { return false }
-		}
-		if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) {
-			return false
-		}
-		return true
+		#endif
+		guard let root = try? verifiedDiskRoot(followSymlinks: !skipSymlinks),
+			let parent = try? root.openParent(of: Self.components(key), createMissing: false),
+			let info = ContainedRoot.entryInfo(parent.leaf, in: parent.directory) else { return false }
+		// Catalog entries must be real files. A permitted directory alias may appear in the parent.
+		return info.st_mode & S_IFMT == S_IFREG
 	}
 
 	public func catalogEligibleRegularFileExists(relativePath rawRelativePath: String) async -> Bool {
@@ -1306,7 +1279,7 @@ public actor FileSystemService {
 		let scan: DirectoryScanResult
 		do {
 			let scanStart = diagnosticsAccumulator == nil ? nil : CFAbsoluteTimeGetCurrent()
-			scan = try Self.listDirectoryWithIgnoreDetection(standardizedParentAbsolutePath, fm: self.fm)
+			scan = try directoryToScan(at: standardizedParentAbsolutePath).scan()
 			if let scanStart {
 				diagnosticsAccumulator?.diagnostics.directoryScanDurationMS += (CFAbsoluteTimeGetCurrent() - scanStart) * 1_000
 			}
@@ -1660,7 +1633,7 @@ public actor FileSystemService {
 		let standardizedParentAbsolutePath = (parentAbsolutePath as NSString).standardizingPath
 		let scan: DirectoryScanResult
 		do {
-			scan = try Self.listDirectoryWithIgnoreDetection(standardizedParentAbsolutePath)
+			scan = try directoryToScan(at: standardizedParentAbsolutePath).scan()
 		} catch {
 			return await fallbackAll()
 		}
@@ -2966,6 +2939,13 @@ public actor FileSystemService {
 			}
 			
 			// ---------- UPDATED FILTER LOGIC ---------------------------------------
+			// A file replaced by a symlink must leave the catalog even on the
+			// incremental path. Let the ordinary directory scan reconcile its
+			// current type (a later event may already have replaced it again).
+			if skipSymlinks, flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsSymlink) != 0 {
+				trackFolder(parentDirectory(of: relPath), eventId: eventId)
+				continue
+			}
 			let isKnown = visitedPaths.contains(relPath)
 			let isUnknownRegularFileLike = parsed.isFile && !isDir && !parsed.isRenamed && !parsed.isRemoved
 			let shouldIgnore: Bool
@@ -3520,12 +3500,7 @@ public actor FileSystemService {
 			perFolderIgnoreCache.removeAll()
 			clearNoIgnoreFilesCache()
 			do {
-				ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
-					for: path,
-					respectGitignore: respectGitignore,
-					respectRepoIgnore: respectRepoIgnore,
-					respectCursorignore: respectCursorignore
-				)
+				ignoreRules = try loadRootIgnoreRules()
 				cacheIgnoreRules(ignoreRules, for: "")
 			} catch {
 				print("Failed to rebuild ignore rules: \(error)")
@@ -3539,12 +3514,7 @@ public actor FileSystemService {
 			perFolderIgnoreCache.removeAll()
 			clearNoIgnoreFilesCache()
 			do {
-				ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
-					for: path,
-					respectGitignore: respectGitignore,
-					respectRepoIgnore: respectRepoIgnore,
-					respectCursorignore: respectCursorignore
-				)
+				ignoreRules = try loadRootIgnoreRules()
 				cacheIgnoreRules(ignoreRules, for: "")
 			} catch {
 				print("Failed to rebuild root ignore rules: \(error)")
@@ -3679,11 +3649,7 @@ public actor FileSystemService {
 		if let provided = scanResult {
 			scan = provided
 		} else {
-			#if DEBUG
-			scan = try Self.listDirectoryWithIgnoreDetection(absPath, fm: self.fm)
-			#else
-			scan = try Self.listDirectoryWithIgnoreDetection(absPath)
-			#endif
+			scan = try directoryToScan(at: absPath).scan()
 		}
 		
 		let dirURL = URL(fileURLWithPath: absPath)
@@ -3727,16 +3693,17 @@ public actor FileSystemService {
 	/// Heavy I/O operation that runs outside the actor for parallelism.
 	/// Uses POSIX opendir/readdir for better performance than FileManager.contentsOfDirectory.
 	private static func enumerateOneLevel(
+		service: FileSystemService,
 		absFolder: String,
 		relFolder: String,
 		skipSymlinks: Bool,
 		rules: IgnoreRulesSnapshot,
 		preserveChildren: Set<String> = []
-	) throws -> ScanResult {
+	) async throws -> ScanResult {
 		// Use the lightweight POSIX-based directory scanner
 		let scan: DirectoryScanResult
 		do {
-			scan = try listDirectoryWithIgnoreDetection(absFolder)
+			scan = try await service.directoryToScan(at: absFolder).scan()
 		} catch {
 			// Return empty result for non-existent or inaccessible paths
 			return ScanResult(
@@ -3759,8 +3726,8 @@ public actor FileSystemService {
 			let childRel = relFolder.isEmpty ? name : "\(relFolder)/\(name)"
 			let isDirEntry = entry.isDir
 			
-			// Skip directory symlinks if configured
-			if entry.isSym && skipSymlinks && isDirEntry {
+			// Skip symlink entries if configured
+			if entry.isSym && skipSymlinks {
 				continue
 			}
 			
@@ -3860,7 +3827,8 @@ public actor FileSystemService {
 					inFlight += 1
 					group.addTask(priority: .utility) {
 						// This runs outside the actor for true parallelism
-						return try Self.enumerateOneLevel(
+						return try await Self.enumerateOneLevel(
+							service: self,
 							absFolder: absFolder,
 							relFolder: folderRel,
 							skipSymlinks: skipLinks,
@@ -3945,11 +3913,12 @@ public actor FileSystemService {
 		}
 		
 		// 2) Single-level listing using POSIX directory scanning
-#if DEBUG
-		let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder, fm: self.fm)
-#else
-		let scanResult = try Self.listDirectoryWithIgnoreDetection(absFolder)
-		#endif
+		let scanResult: DirectoryScanResult
+		do {
+			scanResult = try directoryToScan(at: absFolder).scan()
+		} catch FileSystemError.invalidRelativePath {
+			return removeSubtree(for: folderRelPath)
+		}
 		
 		let parentRules = folderRelPath.isEmpty
 			? ignoreRules
@@ -3977,7 +3946,7 @@ public actor FileSystemService {
 			let childRel = folderRelPath.isEmpty ? name : "\(folderRelPath)/\(name)"
 			let comps = pathCompsCache.components(for: childRel)
 			let isDirEntry = entry.isDir
-			if entry.isSym && skipSymlinks && isDirEntry {
+			if entry.isSym && skipSymlinks {
 				continue
 			}
 			var ignoredAsDir = false
@@ -4141,7 +4110,7 @@ public actor FileSystemService {
 			// The walk awaited per directory: a delete (or a remove event) that
 			// ran on the actor meanwhile already untracked this path. Only add
 			// what is still on disk now.
-			if !fm.fileExists(atPath: getFullPath(forRelativePath: path), isDirectory: nil) { continue }
+			if !fileExistsOnDisk(relativePath: path) { continue }
 			let isDir = actual[path] ?? false
 			visitedPaths.insert(path)
 			visitedItems[path] = isDir
@@ -4149,7 +4118,7 @@ public actor FileSystemService {
 		}
 		for path in tracked.subtracting(actual.keys).sorted(by: { $0.count > $1.count }) {
 			guard visitedPaths.contains(path) else { continue }
-			if fm.fileExists(atPath: getFullPath(forRelativePath: path), isDirectory: nil) { continue }
+			if fileExistsOnDisk(relativePath: path) { continue }
 			let wasDir = visitedItems[path] ?? false
 			visitedPaths.remove(path)
 			visitedItems.removeValue(forKey: path)
@@ -4501,8 +4470,8 @@ public actor FileSystemService {
 				continue
 			}
 
+			if entry.isSym && skipSymlinks { continue }
 			if isDirEntry {
-				if entry.isSym && skipSymlinks { continue }
 
 				folders.append(
 					FSItemDTO(
@@ -4784,7 +4753,7 @@ public actor FileSystemService {
 				_ = fs.fileExists(atPath: url.path, isDirectory: &isDirFlag)
 				
 				let isSym = (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
-				if skipSymlinks && isDirFlag.boolValue && isSym {
+				if skipSymlinks && isSym {
 					continue
 				}
 				
@@ -4823,12 +4792,7 @@ public actor FileSystemService {
 	) async throws -> DirectoryChunkResult {
 		let scanResult: DirectoryScanResult
 		do {
-			let testMode = await service.isTestMode
-			if testMode, let fm = await service.fmTransfer.fileSystem {
-				scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath, fm: fm)
-			} else {
-				scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
-			}
+			scanResult = try await service.directoryToScan(at: context.absPath).scan()
 		} catch {
 			return DirectoryChunkResult(folders: [], files: [], subdirs: [], ignoreCacheDelta: [:])
 		}
@@ -4858,7 +4822,7 @@ public actor FileSystemService {
 	) async throws -> DirectoryChunkResult {
 		let scanResult: DirectoryScanResult
 		do {
-			scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
+			scanResult = try await service.directoryToScan(at: context.absPath).scan()
 		} catch {
 			return DirectoryChunkResult(folders: [], files: [], subdirs: [], ignoreCacheDelta: [:])
 		}
@@ -4900,19 +4864,15 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		return nil
 	}
 
-	let fm = self.fm  // Cache for multiple calls in this method
 	let encodingKey = try containedRelativePath(relativePath)
-	// Open the collapsed path that was checked, not the raw spelling: the
-	// kernel resolves `..` after following a symlink.
-	let fullPath = getFullPath(forRelativePath: encodingKey)
-	guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
-		throw FileSystemError.fileNotFound
-	}
+	let (handle, info) = try openWorkspaceFile(encodingKey)
+	defer { try? handle.close() }
+	return try await readLegacyContent(key: encodingKey, handle: handle, size: info.st_size)
+}
 
-	let attrs    = try fm.attributesOfItem(atPath: fullPath)
-	let fileSize = attrs[.size] as? Int64 ?? 0
-	let url      = URL(fileURLWithPath: fullPath)
-	let ext      = url.pathExtension.lowercased()
+private func readLegacyContent(key encodingKey: String, handle: FileHandle, size fileSize: Int64) async throws -> String? {
+	let url = URL(fileURLWithPath: encodingKey)
+	let ext = url.pathExtension.lowercased()
 
 	// (1) Whitelist → skip binary probe entirely
 	let skipProbe = Self.alwaysTextExtensions.contains(ext)
@@ -4920,23 +4880,21 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 
 	// (2) Optional heuristic probe on first 8 KB
 	if !skipProbe {
-		if let handle = try? FileHandle(forReadingFrom: url) {
-			let probe = try handle.read(upToCount: 8_192) ?? Data()
-			try? handle.close()
-			if Self.isProbablyBinary(probe) { return nil }
-		}
+		let probe = try handle.read(upToCount: 8_192) ?? Data()
+		if Self.isProbablyBinary(probe) { return nil }
+		try handle.seek(toOffset: 0)
 	}
 
 	// (3) Small files – read once, detect encoding
 	if fileSize < 2_000_000 {
-		let detected = try readDataAndDetectEncoding(fullPath)
+		let detected = try decodeLegacyText(handle.readToEnd() ?? Data())
 		recordEncoding(detected.encoding, hasByteOrderMark: detected.hasByteOrderMark, forKey: encodingKey)
 		return detected.string
 	}
 
 	// (4) Larger files – streamed read
-	return try await loadEntireFileContentOptimized(
-		ofRelativePath: relativePath,
+	return try await readStreamedContent(
+		key: encodingKey, handle: handle, fileSize: fileSize,
 		chunkSize:     1_048_576,   // 1 MB
 		fileSizeLimit: 10_000_000   // 10 MB
 	)
@@ -4959,10 +4917,12 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 	///   outcomes as `WorkspaceFileReadResult` cases. Kept source-compatible
 	///   until consumers have moved.
 	public func loadContentWithDate(ofRelativePath relativePath: String) async throws -> (content: String?, modificationDate: Date) {
-		//let _ = getFullPath(forRelativePath: relativePath)
-		async let content = loadContent(ofRelativePath: relativePath)
-		async let modDate = getFileModificationDate(atRelativePath: relativePath)
-		return try await (content, modDate)
+		let key = try containedRelativePath(relativePath)
+		let (handle, info) = try openWorkspaceFile(key)
+		defer { try? handle.close() }
+		let content = Self.alwaysBinaryExtensions.contains((key as NSString).pathExtension.lowercased())
+			? nil : try await readLegacyContent(key: key, handle: handle, size: info.st_size)
+		return (content, Self.modificationDate(info))
 	}
 	
 	/// Loads large files in chunks, detecting encoding on‑the‑fly.
@@ -4991,28 +4951,23 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 			return nil
 		}
 
-		let fm = self.fm  // Cache for multiple calls in this method
-		
 		let encodingKey = try containedRelativePath(relativePath)
-		let fullPath = getFullPath(forRelativePath: encodingKey)
-		guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
-			throw FileSystemError.fileNotFound
-		}
-		
-		// Size guard
-		let attrs = try fm.attributesOfItem(atPath: fullPath)
-		let fileSize = attrs[.size] as? Int64 ?? 0
+		let (handle, info) = try openWorkspaceFile(encodingKey)
+		defer { try? handle.close() }
+		return try await readStreamedContent(key: encodingKey, handle: handle, fileSize: info.st_size,
+			chunkSize: chunkSize, fileSizeLimit: fileSizeLimit)
+	}
+
+	private func readStreamedContent(key encodingKey: String, handle: FileHandle, fileSize: Int64,
+		chunkSize: Int, fileSizeLimit: Int64) async throws -> String? {
 		if fileSize > fileSizeLimit {
 			return "[File too large: \(fileSize) bytes]"
 		}
 		
-		let url  = URL(fileURLWithPath: fullPath)
+		let url  = URL(fileURLWithPath: encodingKey)
 		let ext  = url.pathExtension.lowercased()
 		let skipProbe = Self.alwaysTextExtensions.contains(ext)
 		|| (ext.isEmpty && Self.alwaysTextFilenames.contains(url.lastPathComponent.lowercased()))
-		
-		let handle = try FileHandle(forReadingFrom: url)
-		defer { try? handle.close() }
 		
 		var fullData = Data()
 		fullData.reserveCapacity(Int(fileSize))
@@ -5065,6 +5020,21 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 	/// Default byte limit of `readFileContent(atRelativePath:sizeLimit:)`.
 	public static let defaultTextReadSizeLimit: Int64 = 10_000_000
 
+	/// All disk-backed content reads use the same descriptor walk and obtain
+	/// metadata from the opened file. The selected root itself may be a link.
+	private func openWorkspaceFile(_ key: String) throws -> (handle: FileHandle, info: stat) {
+		let root = try verifiedDiskRoot(followSymlinks: !skipSymlinks)
+		return try root.openForReading(Self.components(key))
+	}
+
+	private static func modificationDate(_ info: stat) -> Date {
+		let time = info.st_mtimespec
+		// Convert the whole seconds before adding the fractional part so this
+		// matches Foundation file attributes at subsecond precision.
+		return Date(timeIntervalSinceReferenceDate: Double(time.tv_sec) - Date.timeIntervalBetween1970AndReferenceDate
+			+ Double(time.tv_nsec) / 1e9)
+	}
+
 	/// Reads `relativePath` as text and reports every other outcome as a
 	/// status. **This is the API to use for any read whose result may be
 	/// written back** (edits, search-and-replace, apply-edits hosts): a file
@@ -5090,21 +5060,15 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 			return .binary
 		}
 
-		let fm = self.fm
-		let fullPath = getFullPath(forRelativePath: key)
-		var isDirectory = ObjCBool(false)
-		guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
-			throw FileSystemError.fileNotFound
-		}
-		guard !isDirectory.boolValue else { throw FileSystemError.isDirectory }
-		let fileSize = try fm.attributesOfItem(atPath: fullPath)[.size] as? Int64 ?? 0
+		let (handle, info) = try openWorkspaceFile(key)
+		defer { try? handle.close() }
+		return try readFileContent(from: handle, fileSize: info.st_size, key: key, limit: limit)
+	}
+
+	private func readFileContent(from handle: FileHandle, fileSize: Int64, key: String, limit: Int64) throws -> WorkspaceFileReadResult {
 		if fileSize > limit {
 			return .tooLarge(byteCount: fileSize, limit: limit)
 		}
-
-		let url = URL(fileURLWithPath: fullPath)
-		let handle = try FileHandle(forReadingFrom: url)
-		defer { try? handle.close() }
 		var data = Data()
 		data.reserveCapacity(Int(fileSize))
 
@@ -5128,9 +5092,11 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		}
 
 		let byteOrderMarkEncoding = Self.detectBOMEncoding(in: data)
+		let filename = (key as NSString).lastPathComponent.lowercased()
+		let ext = (filename as NSString).pathExtension
 		let skipProbe = byteOrderMarkEncoding != nil
 			|| Self.alwaysTextExtensions.contains(ext)
-			|| (ext.isEmpty && Self.alwaysTextFilenames.contains(url.lastPathComponent.lowercased()))
+			|| (ext.isEmpty && Self.alwaysTextFilenames.contains(filename))
 		if !skipProbe && Self.isProbablyBinary(data, sampleSize: Self.binaryProbeLength) {
 			return .binary
 		}
@@ -5159,9 +5125,14 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		atRelativePath relativePath: String,
 		sizeLimit: Int64 = FileSystemService.defaultTextReadSizeLimit
 	) async throws -> (result: WorkspaceFileReadResult, modificationDate: Date) {
-		let modificationDate = try await getFileModificationDate(atRelativePath: try containedRelativePath(relativePath))
-		let result = try await readFileContent(atRelativePath: relativePath, sizeLimit: sizeLimit)
-		return (result, modificationDate)
+		let key = try containedRelativePath(relativePath)
+		let (handle, info) = try openWorkspaceFile(key)
+		defer { try? handle.close() }
+		let date = Self.modificationDate(info)
+		if Self.alwaysBinaryExtensions.contains((key as NSString).pathExtension.lowercased()) {
+			return (.binary, date)
+		}
+		return (try readFileContent(from: handle, fileSize: info.st_size, key: key, limit: max(0, sizeLimit)), date)
 	}
 
 	/// Decodes a whole file: a byte-order mark decides the encoding (and is
@@ -5170,7 +5141,7 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 		if data.isEmpty {
 			return .text("", encoding: .utf8, hasByteOrderMark: false)
 		}
-		if let encoding = byteOrderMarkEncoding, let mark = Self.byteOrderMark(for: encoding) {
+		if let encoding = byteOrderMarkEncoding, let mark = WorkspaceFileReadResult.byteOrderMark(for: encoding) {
 			guard let text = String(data: data.dropFirst(mark.count), encoding: encoding) else {
 				return .undecodable(encoding: encoding)
 			}
@@ -5197,16 +5168,6 @@ public func loadContent(ofRelativePath relativePath: String) async throws -> Str
 
 	/// The byte-order mark `editFile` writes for `encoding`, or nil for
 	/// encodings without one (or that emit their own, like `.utf16`).
-	private static func byteOrderMark(for encoding: String.Encoding) -> Data? {
-		switch encoding {
-		case .utf8: return Data([0xEF, 0xBB, 0xBF])
-		case .utf16LittleEndian: return Data([0xFF, 0xFE])
-		case .utf16BigEndian: return Data([0xFE, 0xFF])
-		case .utf32LittleEndian: return Data([0xFF, 0xFE, 0x00, 0x00])
-		case .utf32BigEndian: return Data([0x00, 0x00, 0xFE, 0xFF])
-		default: return nil
-		}
-	}
 	
 	/// Attempt to decode with all post‑UTF‑8 fall‑backs, including region‑specific ones.
 	private func tryDecodeWithFallbackEncodings(_ data: Data) -> String? {
@@ -5317,7 +5278,10 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	}
 
 	public func updateSkipSymlinks(_ newValue: Bool) {
-		self.skipSymlinks = newValue
+		guard skipSymlinks != newValue else { return }
+		skipSymlinks = newValue
+		ignoreRules = (try? loadRootIgnoreRules()) ?? IgnoreRulesManager.rootRules(git: nil, repo: nil, cursor: nil)
+		invalidateAllIgnoreCaches()
 	}
 	
 	public func updateEnableHierarchicalIgnores(_ newValue: Bool) {
@@ -5331,12 +5295,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	}
 	
 	public func refreshIgnoreRules() async throws {
-		self.ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
-			for: self.path,
-			respectGitignore: self.respectGitignore,
-			respectRepoIgnore: self.respectRepoIgnore,
-			respectCursorignore: self.respectCursorignore
-		)
+		self.ignoreRules = try loadRootIgnoreRules()
 		invalidateAllIgnoreCaches()
 	}
 	
@@ -5357,7 +5316,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 						userInfo: [NSLocalizedDescriptionKey: "Unable to encode text as UTF-8"]))
 		}
 		
-		if let root = try openContainedRoot() {
+		if let root = try openContainedRoot(createMissing: true) {
 			// Directories are created and the file written relative to the
 			// descriptors the containment walk opened (no path re-resolution).
 			let (directory, _, leaf) = try root.openParent(of: Self.components(relativePath), createMissing: true)
@@ -5389,7 +5348,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 			// --- 1. do I/O off-actor ----------------------------------------
 			do {
 				try await Task.detached(priority: .utility) {
-					try FileSystemService.writeFileRobust(to: fullURL, data: data)
+					try FileSystemService.writeFileRobust(to: fullURL, data: data, createOnly: true)
 				}.value                                    // bubbles error
 			} catch {
 				throw FileSystemError.failedToCreateFile(error)
@@ -5559,18 +5518,8 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		}
 		let fullURL = URL(fileURLWithPath: lexicalAbsolutePath(relativePath))
 		let enc = encodingMap[relativePath] ?? .utf8
-		guard var data = newContent.data(using: enc) else {
-			throw FileSystemError.failedToEditFile(
-				NSError(domain: "encoding", code: -1,
-						userInfo: [NSLocalizedDescriptionKey: "Unable to encode text as \(enc)"]))
-		}
-		
-		if byteOrderMarkPaths.contains(relativePath),
-			let mark = Self.byteOrderMark(for: enc),
-			!data.starts(with: mark) {
-			data = mark + data
-		}
-		let payload = data
+		let payload = try WorkspaceFileReadResult.encode(newContent, using: enc,
+			hasByteOrderMark: byteOrderMarkPaths.contains(relativePath))
 		
 		// --- 1. do I/O off-actor ----------------------------------------
 		do {
@@ -5916,8 +5865,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	/// The fast-path now uses the length-aware `String(data:encoding:)`
 	/// instead of `String(validatingUTF8:)`, eliminating crashes caused by
 	/// missing NUL-termination in `Data` buffers.
-	private func readDataAndDetectEncoding(_ fullPath: String) throws -> DetectedText {
-		let data = try Data(contentsOf: URL(fileURLWithPath: fullPath))
+	private func decodeLegacyText(_ data: Data) throws -> DetectedText {
 		
 		// 0 --> return empty string immediately  ✅
 		if data.isEmpty {
@@ -6006,11 +5954,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		// Performance optimization: batch check both files at once
 		// This method is only called when hierarchical ignores are enabled
 		// We need to check what files exist
-		#if DEBUG
-		let scanResult = try Self.listDirectoryWithIgnoreDetection(dirURL.path, fm: self.fm)
-		#else
-		let scanResult = try Self.listDirectoryWithIgnoreDetection(dirURL.path)
-		#endif
+		let scanResult = try directoryToScan(at: dirURL.path).scan()
 		return try await getEffectiveRulesOptimized(
 			for: dirURL,
 			parentRelPath: parentRelPath,
@@ -6021,6 +5965,34 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		)
 	}
 	
+	private func readIgnoreFile(_ relativePath: String) throws -> String? {
+		#if DEBUG
+		if let fs = fileManagerOverride, !(fs is FileManager) {
+			let path = getFullPath(forRelativePath: relativePath)
+			return fs.contents(atPath: path).flatMap { String(data: $0, encoding: .utf8) }
+		}
+		#endif
+		let handle: FileHandle
+		do {
+			handle = try openWorkspaceFile(relativePath).handle
+		} catch FileSystemError.fileNotFound { return nil }
+		catch FileSystemError.invalidRelativePath { return nil }
+		catch FileSystemError.isDirectory { return nil }
+		defer { try? handle.close() }
+		guard let text = String(data: try handle.readToEnd() ?? Data(), encoding: .utf8) else {
+			throw CocoaError(.fileReadInapplicableStringEncoding)
+		}
+		return text
+	}
+
+	private func loadRootIgnoreRules() throws -> IgnoreRules {
+		try IgnoreRulesManager.rootRules(
+			git: respectGitignore ? readIgnoreFile(".gitignore") : nil,
+			repo: respectRepoIgnore ? readIgnoreFile(".repo_ignore") : nil,
+			cursor: respectCursorignore ? readIgnoreFile(".cursorignore") : nil
+		)
+	}
+
 	/// Optimized version that minimizes file system operations
 	private func getEffectiveRulesOptimized(
 		for dirURL: URL,
@@ -6058,72 +6030,15 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		// Clone parent rules and add new layers
 		let effectiveRules = parentRules.clone()
 		
-		if hasGitignore && respectGitignore {
-			let gitignoreURL = dirURL.appendingPathComponent(".gitignore")
+		for (name, enabled) in [(".gitignore", hasGitignore && respectGitignore),
+			(".repo_ignore", hasRepoIgnore), (".cursorignore", hasCursorignore)] where enabled {
 			do {
-				#if DEBUG
-				let content: String
-				if fm is FileManager {
-					// Use fast production path for real file system
-					content = try String(contentsOf: gitignoreURL, encoding: .utf8)
-				} else {
-					// Test path - use virtual filesystem
-					let data = fm.contents(atPath: gitignoreURL.path) ?? Data()
-					content = String(data: data, encoding: .utf8) ?? ""
+				let key = Self.joinRelativePaths(base: try workspaceRelativeDirectory(dirURL.path), child: name)
+				if let text = try readIgnoreFile(key) {
+					effectiveRules.addCompiledLayer(GitignoreCompiler.compile(content: text, directoryPath: parentRelPath))
 				}
-				#else
-				let content = try String(contentsOf: gitignoreURL, encoding: .utf8)
-				#endif
-				let compiled = GitignoreCompiler.compile(content: content, directoryPath: parentRelPath)
-				effectiveRules.addCompiledLayer(compiled)
 			} catch {
-				print("Failed to compile .gitignore at \(gitignoreURL.path): \(error)")
-			}
-		}
-		
-		if hasRepoIgnore {
-			let repoIgnoreURL = dirURL.appendingPathComponent(".repo_ignore")
-			do {
-				#if DEBUG
-				let content: String
-				if fm is FileManager {
-					// Use fast production path for real file system
-					content = try String(contentsOf: repoIgnoreURL, encoding: .utf8)
-				} else {
-					// Test path - use virtual filesystem
-					let data = fm.contents(atPath: repoIgnoreURL.path) ?? Data()
-					content = String(data: data, encoding: .utf8) ?? ""
-				}
-				#else
-				let content = try String(contentsOf: repoIgnoreURL, encoding: .utf8)
-				#endif
-				let compiled = GitignoreCompiler.compile(content: content, directoryPath: parentRelPath)
-				effectiveRules.addCompiledLayer(compiled)
-			} catch {
-				print("Failed to compile .repo_ignore at \(repoIgnoreURL.path): \(error)")
-			}
-		}
-		
-		if hasCursorignore {
-			let cursorignoreURL = dirURL.appendingPathComponent(".cursorignore")
-			do {
-				#if DEBUG
-				let content: String
-				if fm is FileManager {
-					// Use fast production path for real file system
-					content = try String(contentsOf: cursorignoreURL, encoding: .utf8)
-				} else {
-					// Test path - use virtual filesystem
-					let data = fm.contents(atPath: cursorignoreURL.path) ?? Data()
-					content = String(data: data, encoding: .utf8) ?? ""
-				}
-				#else
-				let content = try String(contentsOf: cursorignoreURL, encoding: .utf8)
-				#endif
-				let compiled = GitignoreCompiler.compile(content: content, directoryPath: parentRelPath)
-				effectiveRules.addCompiledLayer(compiled)
-			} catch {
-				print("Failed to compile .cursorignore at \(cursorignoreURL.path): \(error)")
+				print("Failed to compile \(name) at \(dirURL.path): \(error)")
 			}
 		}
 		
@@ -6220,27 +6135,49 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		cacheIgnoreRules(parentRules, for: path)
 	}
 	
-	/// Reads a directory using `opendir` and `readdir`, skipping "." and "..".
-	/// Mark it static so it doesn't require an instance of `self`.
-	private static func listDirectory(_ path: String) throws -> [DirEntry] {
-		let result = try listDirectoryWithIgnoreDetection(path)
-		return result.entries
-	}
-	
-	#if DEBUG
-	/// DEBUG build: use the injected virtual filesystem (`fm`) instead of
-	/// POSIX `opendir`, so tests that rely on `InMemoryFS` / `SpyFS` see
-	/// their virtual files and ignore rules.
-	private static func listDirectoryWithIgnoreDetection(
-		_ path: String,
-		fm: any TestFS
-	) throws -> DirectoryScanResult {
-		// If we're running with the real file system, use the same fast
-		// POSIX implementation as Release builds so behavior & perf match.
-		if fm is FileManager {
-			return try listDirectoryWithIgnoreDetection(path)  // POSIX version
+	private enum DirectoryToScan: Sendable {
+		case disk(ContainedRoot, [String])
+		#if DEBUG
+		case virtual(String, TestFSTransfer)
+		#endif
+
+		func scan() throws -> DirectoryScanResult {
+			switch self {
+			case .disk(let root, let components):
+				return try FileSystemService.scanDiskDirectory(root: root, components: components)
+			#if DEBUG
+			case .virtual(let path, let transfer):
+				guard let fs = transfer.fileSystem else { throw FileSystemError.fileNotFound }
+				return try FileSystemService.scanVirtualDirectory(path, fm: fs)
+			#endif
+			}
 		}
-		
+	}
+
+	private func workspaceRelativeDirectory(_ absolutePath: String) throws -> String {
+		guard absolutePath.hasPrefix("/"), !StandardizedPath.containsNUL(absolutePath) else {
+			throw FileSystemError.invalidRelativePath
+		}
+		for spelling in [standardizedRootPath, canonicalRootPath, realRootPath] {
+			let relative = RelativePath.fromStandardized(standardizedAbsolutePath: absolutePath, standardizedRootPath: spelling)
+			if !relative.hasPrefix("/") { return relative }
+		}
+		throw FileSystemError.invalidRelativePath
+	}
+
+	/// Resolve against the pinned workspace root; the worker can walk and enumerate off-actor.
+	private func directoryToScan(at absolutePath: String) throws -> DirectoryToScan {
+		let relative = try workspaceRelativeDirectory(absolutePath)
+		#if DEBUG
+		if let fs = fileManagerOverride, !(fs is FileManager) {
+			return .virtual(absolutePath, TestFSTransfer(fs))
+		}
+		#endif
+		return .disk(try verifiedDiskRoot(followSymlinks: !skipSymlinks), Self.components(relative))
+	}
+
+	#if DEBUG
+	private static func scanVirtualDirectory(_ path: String, fm: any TestFS) throws -> DirectoryScanResult {
 		// ---------- Unit-test path (virtual FS) ----------
 		let dirURL = URL(fileURLWithPath: path)
 		let children = try fm.contentsOfDirectory(
@@ -6377,20 +6314,19 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		return (noFollowType == S_IFDIR, false, noFollowType == S_IFREG)
 	}
 	
-	/// Enhanced directory listing that also detects ignore files
-	private static func listDirectoryWithIgnoreDetection(_ path: String) throws -> DirectoryScanResult {
-		// Open the directory
-		guard let dir = opendir(path) else {
-			throw NSError(
-				domain: "listDirectory",
-				code: 1,
-				userInfo: [NSLocalizedDescriptionKey: "Failed to open directory: \(path)"]
-			)
+	/// Enumerate the verified directory itself. Opening "." through its descriptor
+	/// gives the stream an independent position and ownership of its own descriptor.
+	private static func scanDiskDirectory(root: ContainedRoot, components: [String]) throws -> DirectoryScanResult {
+		let (directory, _) = try root.openDirectory(components, createMissing: false)
+		let fd = openat(directory.fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+		guard fd >= 0 else { throw ContainedRoot.posixError(errno, "openat", ".") }
+		guard let dir = fdopendir(fd) else {
+			let error = errno
+			close(fd)
+			throw ContainedRoot.posixError(error, "fdopendir", ".")
 		}
-		defer {
-			closedir(dir) // Ensure the directory is closed when done
-		}
-		
+		defer { closedir(dir) }
+
 		var entries = [DirEntry]()
 		var hasGitignore = false
 		var hasRepoIgnore = false
@@ -6401,7 +6337,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 			errno = 0 // Reset errno before each readdir call
 			guard let direntPtr = readdir(dir) else {
 				if errno != 0 {
-					print("Error reading directory entry for path \(path): \(String(cString: strerror(errno)))")
+					throw ContainedRoot.posixError(errno, "readdir", components.joined(separator: "/"))
 				}
 				break // Exit loop on error or end of directory
 			}
@@ -6475,97 +6411,11 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		)
 	}
 	
-	/// Reads a directory using `scandir(3)`, skipping "." and "..".
-	/// Mark it static so it doesn't require an instance of `self`.
-	private static func scandirListDirectory(_ path: String) throws -> [DirEntry] {
-		var namelist: UnsafeMutablePointer<UnsafeMutablePointer<dirent>?>? = nil
-		
-		let count = scandir(path, &namelist, nil, nil)
-		guard count >= 0 else {
-			throw NSError(
-				domain: "scandirListDirectory",
-				code: 1,
-				userInfo: [NSLocalizedDescriptionKey: "Failed to open directory: \(path)"]
-			)
-		}
-		defer {
-			// Free the memory allocated by scandir
-			for i in 0..<count {
-				free(namelist![Int(i)])
-			}
-			free(namelist)
-		}
-		
-		var entries = [DirEntry]()
-		entries.reserveCapacity(Int(count))
-		
-		for i in 0..<count {
-			// Copy dirent into local var so the pointer remains valid for the entire iteration
-			let localDirent = namelist![Int(i)]!.pointee
-			
-			// Safely convert d_name -> Swift String
-			guard let decoded = decodeDirentName(localDirent) else {
-				continue
-			}
-			let rawName = decoded.name
-			
-			// Skip "." and ".."
-			guard rawName != ".", rawName != ".." else {
-				continue
-			}
-			if Self.isRepoPromptTempFilename(rawName) {
-				continue
-			}
-			
-			let dType = localDirent.d_type  // This is a UInt8
-			var isDir = false
-			var isSym = false
-			var isRegularFile: Bool? = nil
-			
-			switch Int32(dType) {
-			case DT_DIR:
-				isDir = true
-				isRegularFile = false
-			case DT_REG:
-				isRegularFile = true
-			case DT_LNK:
-				isSym = true
-				let fullPath = (path as NSString).appendingPathComponent(rawName)
-				var st = stat()
-				if stat(fullPath, &st) == 0,
-				   (st.st_mode & S_IFMT) == S_IFDIR {
-					isDir = true
-				}
-				isRegularFile = nil
-			case DT_UNKNOWN:
-				// If d_type is unknown, do a stat() fallback
-				let fullPath = (path as NSString).appendingPathComponent(rawName)
-				var st = stat()
-				if stat(fullPath, &st) == 0 {
-					let mode = st.st_mode & S_IFMT
-					isDir = mode == S_IFDIR
-					isRegularFile = mode == S_IFREG
-				}
-			default:
-				// e.g. DT_FIFO, DT_CHR, etc.
-				isRegularFile = false
-			}
-			
-			// Finally, record the entry
-			entries.append(DirEntry(name: rawName, isDir: isDir, isSym: isSym, isRegularFile: isRegularFile))
-		}
-		
-		return entries
-	}
-	
 	public func detectFileEncoding(atRelativePath relativePath: String) async throws -> String.Encoding {
-		let fullPath = getFullPath(forRelativePath: relativePath)
-		let url = URL(fileURLWithPath: fullPath)
-		
-		guard let data = try? Data(contentsOf: url) else {
-			throw FileSystemError.failedToReadFile
-		}
-		
+		let (handle, _) = try openWorkspaceFile(containedRelativePath(relativePath))
+		defer { try? handle.close() }
+		let data = try handle.readToEnd() ?? Data()
+
 		var usedLossyConversion = ObjCBool(false)
 		let encodingValue = NSString.stringEncoding(
 			for: data,
@@ -6636,24 +6486,26 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		return relative
 	}
 
-	/// The root opened for one descriptor-relative operation (see
-	/// `ContainedRoot`), or nil when the service runs on a file-system test
-	/// double or on a root that has never existed on disk; those keep the
-	/// path-based code with lexical containment only.
-	///
-	/// - Throws: `fileNotFound` when the root existed when the service was
-	///   created and is gone now, so a write does not re-create it.
-	private func openContainedRoot() throws -> ContainedRoot? {
+	private func verifiedDiskRoot(followSymlinks: Bool) throws -> ContainedRoot {
+		let root = try ContainedRoot(path: standardizedRootPath,
+			alternateSpellings: [canonicalRootPath, realRootPath], followSymlinks: followSymlinks)
+		guard root.realPath == realRootPath else { throw FileSystemError.invalidRelativePath }
+		return root
+	}
+
+	/// Only test filesystem doubles use the path-based mutation implementation.
+	private func openContainedRoot(createMissing: Bool = false) throws -> ContainedRoot? {
 		#if DEBUG
-		if let override = fileManagerOverride, !(override is FileManager) {
-			return nil
-		}
+		if let override = fileManagerOverride, !(override is FileManager) { return nil }
 		#endif
 		do {
-			return try ContainedRoot(path: standardizedRootPath, alternateSpellings: [canonicalRootPath, realRootPath])
-		} catch {
-			if rootExistedAtInit { throw FileSystemError.fileNotFound }
-			return nil
+			return try verifiedDiskRoot(followSymlinks: true)
+		} catch FileSystemError.fileNotFound where createMissing && !rootExistedAtInit {
+			// The root was absent at setup. Create its expected physical path
+			// without following links installed in the meantime.
+			let filesystem = try ContainedRoot(path: "/", alternateSpellings: [], followSymlinks: false)
+			_ = try filesystem.openDirectory(Self.components(realRootPath), createMissing: true)
+			return try verifiedDiskRoot(followSymlinks: true)
 		}
 	}
 
@@ -6668,6 +6520,21 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 	private enum RelativeEventPath {
 		case inside(relative: String)
 		case outside(originalAbsolute: String)
+	}
+
+	/// Preserve the kernel spelling of the nearest existing ancestor, even for
+	/// a root that will only be created by the first write.
+	private nonisolated static func plannedRealPath(_ path: String) -> String {
+		var ancestor = path as NSString
+		var missing: [String] = []
+		while ancestor.length > 1 {
+			if let resolved = posixRealPath(ancestor as String) {
+				return missing.reversed().reduce(resolved) { ($0 as NSString).appendingPathComponent($1) }
+			}
+			missing.append(ancestor.lastPathComponent)
+			ancestor = ancestor.deletingLastPathComponent as NSString
+		}
+		return path
 	}
 
 	/// Kernel-resolved absolute path (keeps `/private`, unlike Foundation's
@@ -7010,12 +6877,13 @@ public extension FileSystemService {
 	/// the last component relative to it.
 	internal static func writeFileRobust(
 		to url: URL,
-		data: Data
+		data: Data,
+		createOnly: Bool = false
 	) throws {
 		let parent = url.deletingLastPathComponent().path
 		let fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
 		guard fd >= 0 else { throw posixError(errno, "open", parent) }
-		try writeFileRobust(inDirectory: ContainedDirectory(adopting: fd), name: url.lastPathComponent, data: data)
+		try writeFileRobust(inDirectory: ContainedDirectory(adopting: fd), name: url.lastPathComponent, data: data, createOnly: createOnly)
 	}
 
 	/// Writes `data` to the entry `name` of `directory` without ever leaving an
@@ -7052,6 +6920,7 @@ public extension FileSystemService {
 		createOnly: Bool = false
 	) throws {
 		let destination = ContainedRoot.entryInfo(name, in: directory)
+		if createOnly, destination != nil { throw posixError(EEXIST, "create", name) }
 		let destinationType = destination.map { $0.st_mode & S_IFMT }
 		let destinationIsRegularFile = destinationType == S_IFREG
 		if let destinationType, destinationType != S_IFREG, destinationType != S_IFLNK {
@@ -7072,13 +6941,18 @@ public extension FileSystemService {
 			#else
 			let simulated: Int32 = 0
 			#endif
-			if createOnly, destination == nil {
+			if createOnly {
 				if renameatx_np(directory.fd, tempName, directory.fd, name, UInt32(RENAME_EXCL)) == 0 { return }
 				let exclusiveError = errno
-				if exclusiveError != ENOTSUP && exclusiveError != EINVAL {
-					unlinkat(directory.fd, tempName, 0)
+				defer { unlinkat(directory.fd, tempName, 0) }
+				guard exclusiveError == ENOTSUP || exclusiveError == EINVAL else {
 					throw posixError(exclusiveError, "rename", name)
 				}
+				// linkat publishes the complete temporary file only if the name is free.
+				guard linkat(directory.fd, tempName, directory.fd, name, 0) == 0 else {
+					throw posixError(errno, "linkat", name)
+				}
+				return
 			}
 			if simulated == 0, renameat(directory.fd, tempName, directory.fd, name) == 0 { return }
 			let renameError = simulated != 0 ? simulated : errno
