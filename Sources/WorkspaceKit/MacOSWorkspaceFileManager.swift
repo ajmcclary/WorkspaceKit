@@ -7,9 +7,11 @@ import Foundation
 /// macOS adapter conforming to both `WorkspaceFileTree` and
 /// `WorkspaceFileWatching`.
 ///
-/// Uses `FileManager` for directory enumeration and `FSEvents`
-/// for file watching. Children are loaded lazily — only cached
-/// directories are refreshed on FSEvents.
+/// Uses `FileManager` for directory enumeration and a two-second
+/// modification-date poll for watching (no FSEvents). Children are
+/// loaded lazily — only cached directories are refreshed when a poll
+/// sees a change. For recursive FSEvents-driven watching, use
+/// `FileSystemServiceWorkspaceWatcher` from `WorkspaceFileSystem`.
 @MainActor
 public final class MacOSWorkspaceFileManager: WorkspaceFileTree, WorkspaceFileWatching {
     // MARK: - Types
