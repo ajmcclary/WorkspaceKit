@@ -357,6 +357,7 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		let fm = FileManager.default
 		let pendingRoot = rootURL.appendingPathComponent("pending")
 		let service = try await FileSystemService(path: pendingRoot.path)
+		XCTAssertNil(service.authorizedRootPath)
 		try await service.createFile(atRelativePath: "first.txt", content: "local")
 		let read = try await service.readFileContent(atRelativePath: "first.txt")
 		XCTAssertEqual(read.text, "local")
@@ -364,8 +365,10 @@ final class FileSystemServiceWriteContainmentTests: XCTestCase {
 		let alias = rootURL.appendingPathComponent("alias")
 		try fm.createSymbolicLink(at: alias, withDestinationURL: pendingRoot)
 		let bound = try await FileSystemService(path: alias.path)
+		let authorized = try XCTUnwrap(bound.authorizedRootPath)
 		try fm.removeItem(at: alias)
 		try fm.createSymbolicLink(at: alias, withDestinationURL: outsideURL)
+		XCTAssertEqual(bound.authorizedRootPath, authorized)
 		await assertInvalidRelativePath({ _ = try await bound.readFileContent(atRelativePath: "first.txt") }, "changed root")
 		await assertInvalidRelativePath({ try await bound.createFile(atRelativePath: "first.txt", content: "new") }, "changed root")
 		XCTAssertEqual(try fm.contentsOfDirectory(atPath: outsideURL.path), [])

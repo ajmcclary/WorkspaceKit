@@ -444,6 +444,10 @@ public actor FileSystemService {
 	/// only when the path still exists, so events for just-deleted paths would
 	/// otherwise map outside the root and be dropped.
 	private let realRootPath: String
+	/// Physical directory authorized when this service was created. Clients
+	/// approving a destination compare against this binding across user prompts.
+	public nonisolated var authorizedRootPath: String? { rootExistedAtInit ? realRootPath : nil }
+
 	private var canonicalRootPath: String { canonicalRootURL.path }
 	private var standardizedRootPath: String { rootURL.path }
 	private var respectGitignore: Bool
@@ -991,17 +995,33 @@ public actor FileSystemService {
 
 	public func regularFileExistsOnDisk(relativePath rawRelativePath: String) -> Bool {
 		guard let key = try? containedRelativePath(rawRelativePath) else { return false }
+		return catalogLeafIneligibility(for: key) == nil
+	}
+
+	/// Classify the workspace entry without querying a leaf through an unverified parent.
+	private func catalogLeafIneligibility(for key: String) -> CatalogRegularFileIneligibilityReason? {
 		#if DEBUG
 		if let fs = fileManagerOverride, !(fs is FileManager) {
 			var isDirectory = ObjCBool(false)
-			return fs.fileExists(atPath: getFullPath(forRelativePath: key), isDirectory: &isDirectory) && !isDirectory.boolValue
+			let exists = fs.fileExists(atPath: getFullPath(forRelativePath: key), isDirectory: &isDirectory)
+			return exists && !isDirectory.boolValue ? nil : .missingOrDirectory
 		}
 		#endif
-		guard let root = try? verifiedDiskRoot(followSymlinks: !skipSymlinks),
-			let parent = try? root.openParent(of: Self.components(key), createMissing: false),
-			let info = ContainedRoot.entryInfo(parent.leaf, in: parent.directory) else { return false }
-		// Catalog entries must be real files. A permitted directory alias may appear in the parent.
-		return info.st_mode & S_IFMT == S_IFREG
+		do {
+			let root = try verifiedDiskRoot(followSymlinks: !skipSymlinks)
+			let parent = try root.openParent(of: Self.components(key), createMissing: false)
+			guard let info = ContainedRoot.entryInfo(parent.leaf, in: parent.directory) else { return .missingOrDirectory }
+			switch info.st_mode & S_IFMT {
+			case S_IFREG: return nil
+			case S_IFLNK: return .symbolicLink
+			case S_IFDIR: return .missingOrDirectory
+			default: return .nonRegularFile
+			}
+		} catch FileSystemError.invalidRelativePath {
+			return skipSymlinks ? .symlinkComponent : .outsideCanonicalRoot
+		} catch {
+			return .missingOrDirectory
+		}
 	}
 
 	public func catalogEligibleRegularFileExists(relativePath rawRelativePath: String) async -> Bool {
@@ -1401,12 +1421,12 @@ public actor FileSystemService {
 				continue
 			}
 
-			if entry.isDir {
-				setResult(.ineligible(.missingOrDirectory), for: path.relativePath)
-				continue
-			}
 			if entry.isSym {
 				setResult(.ineligible(.symbolicLink), for: path.relativePath)
+				continue
+			}
+			if entry.isDir {
+				setResult(.ineligible(.missingOrDirectory), for: path.relativePath)
 				continue
 			}
 			guard let isRegularFile = entry.isRegularFile else {
@@ -1683,12 +1703,12 @@ public actor FileSystemService {
 				continue
 			}
 
-			if entry.isDir {
-				results[path.relativePath] = .ineligible(.missingOrDirectory)
-				continue
-			}
 			if entry.isSym {
 				results[path.relativePath] = .ineligible(.symbolicLink)
+				continue
+			}
+			if entry.isDir {
+				results[path.relativePath] = .ineligible(.missingOrDirectory)
 				continue
 			}
 			guard let isRegularFile = entry.isRegularFile else {
@@ -2018,23 +2038,9 @@ public actor FileSystemService {
 		let rootPrefix = standardizedRootPath.hasSuffix("/") ? standardizedRootPath : standardizedRootPath + "/"
 		guard standardizedAbsolutePath.hasPrefix(rootPrefix) else { return .ineligible(.outsideRoot) }
 
-		var isDirectory = ObjCBool(false)
-		guard fm.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), !isDirectory.boolValue else {
-			return .ineligible(.missingOrDirectory)
-		}
-		let url = URL(fileURLWithPath: standardizedAbsolutePath)
-		if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
-			if values.isSymbolicLink == true { return .ineligible(.symbolicLink) }
-			if values.isRegularFile == false { return .ineligible(.nonRegularFile) }
-		}
-		if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) {
-			return .ineligible(.symlinkComponent)
-		}
-
-		let canonicalPath = url.resolvingSymlinksInPath().path
-		let canonicalPrefix = canonicalRootPath.hasSuffix("/") ? canonicalRootPath : canonicalRootPath + "/"
-		guard canonicalPath == canonicalRootPath || canonicalPath.hasPrefix(canonicalPrefix) else {
-			return .ineligible(.outsideCanonicalRoot)
+		guard !StandardizedPath.containsNUL(relativePath) else { return .ineligible(.invalidRelativePath) }
+		if let reason = catalogLeafIneligibility(for: relativePath) {
+			return .ineligible(reason)
 		}
 
 		let isIgnored: Bool
@@ -6299,17 +6305,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 		let noFollowType = st.st_mode & S_IFMT
 		let isSym = (noFollowType == S_IFLNK)
 
-		if isSym {
-			let followResult = nameBuffer.withUnsafeBufferPointer { buffer -> Int32 in
-				guard let base = buffer.baseAddress else { return -1 }
-				return fstatat(fd, base, &st, 0)
-			}
-			if followResult == 0 {
-				let followType = st.st_mode & S_IFMT
-				return (followType == S_IFDIR, true, nil)
-			}
-			return (false, true, nil)
-		}
+		if isSym { return (false, true, nil) }
 
 		return (noFollowType == S_IFDIR, false, noFollowType == S_IFREG)
 	}
@@ -6378,14 +6374,7 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 			case DT_REG:
 				isRegularFile = true
 			case DT_LNK:
-				let fallback = fileTypeFallback(
-					dir: dir,
-					entry: dirent,
-					nameLength: decoded.length
-				)
-				isDir = fallback.isDir
 				isSym = true
-				isRegularFile = nil
 			case DT_UNKNOWN:
 				let fallback = fileTypeFallback(
 					dir: dir,
@@ -6399,6 +6388,11 @@ public func detectEncodingForInitialChunk(initialData: Data) throws -> String.En
 				isRegularFile = false
 			}
 			
+			if isSym {
+				// A link is a catalog folder only if this policy can open its target
+				// as a directory within the workspace. Never query an outside leaf.
+				isDir = (try? root.openDirectory(components + [fileName], createMissing: false)) != nil
+			}
 			// Add the entry to the results
 			entries.append(DirEntry(name: fileName, isDir: isDir, isSym: isSym, isRegularFile: isRegularFile))
 		}
